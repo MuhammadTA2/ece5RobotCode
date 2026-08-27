@@ -1,388 +1,1155 @@
-/* ************************************************************************************************* */
-// UCSD ECE 5 Lab 4 Code: Line Following Robot with PID 
-// to be edited by Muhammad Abouelkhir
-// V 5.0
-// Last Modified 8/24/2026 by MingWei Yeoh, Karcher Morris, and Korey Huynh
-/* ************************************************************************************************* */
+/* *************************************************************************************************
+   UCSD ECE 5 Lab 4: Experimental PID Line-Following Robot
+   Edited by Muhammad Abouelkhir
 
+   LF_original.ino is the unchanged reference implementation. This file is the experimental sketch.
 
-/*
-   This is code for your PID controlled line following robot.
+   FEATURES
+   - Floating-point, potentiometer-controlled PID with a fixed-time control loop
+   - Documented calibration and test values in one settings area
+   - Weighted line confidence and confidence-based speed reduction
+   - PID anti-windup, derivative filtering, turn clamping, and turn slew limiting
+   - Motor mixing that preserves steering instead of clipping one saturated wheel
+   - Automatic physical traceback after confirmed total line loss
+   - Sixteen stored post-PID wheel actions, including PID steering and action duration
+   - Serial Plotter telemetry plus optional oscilloscope debug PWM outputs
 
-   ******      Code Table of Contents      ******
+   RECOMMENDED TEST ORDER
+   1. Raise the wheels. Confirm forward, left, right, stop, and reverse motor directions.
+   2. Calibrate white and black, then inspect the printed calibration spans.
+   3. Tune BLACK_DETECTION_THRESHOLD at low speed.
+   4. Set Ki and Kd to zero. Raise Kp until oscillation starts, then reduce Kp 20-30%.
+   5. Add Kd until oscillation is damped. Add only enough Ki to remove persistent bias.
+   6. Tune speed, turn limits, confidence, and finally traceback.
 
-  - Line_Follower_Code_Basic
-   > Declare libraries     - declares global variables so each variable can be accessed from every function
-   > Declare Pins          - where the user sets what pin everything is connected to 
-   > Settings              - settings that can improve robot functionality and help to debug
-   > Setup (Main)          - runs once at beginning when you press button on arduino or when you open serial monitor
-   > Loop  (Main)          - loops forever calling on a series of function
-   
-  - Calibration 
-   > Main Calibrate()      - runs calibration function calls and synchronizes calibration state with different led animations
-  
-  - Helper_Functions
-   > setLEDs               - turns on all LEDs in the LED_Pin array on or off
-   > Read Potentiometers   - reads each potentiometer
-   > Read Photoresistors   - reads each photoresistor
-   > Run Motors            - runs motors
-   > Calculate Error       - calculate error from photoresistor readings
-   > PID Turn              - takes the error and implements PID control
-   > Print                 - used for printing information but should disable when not debugging because it slows down program
+   POTENTIOMETER MATH
+     fraction = filtered ADC / 4095
+     gain = GAIN_MIN + fraction * (GAIN_MAX - GAIN_MIN)
+     ADC for a desired gain = 4095 * (gain - GAIN_MIN) / (GAIN_MAX - GAIN_MIN)
 
-*/
+   OSCILLOSCOPE SAFETY
+   Do not attach a normal grounded probe across H-bridge motor terminals. The optional scope outputs
+   below are logic-level debug signals referenced to ESP32 ground. Add an RC low-pass filter if an
+   analog-looking error/turn trace is desired.
+************************************************************************************************* */
 
-// Include files needed
-//#include <L298NX2.h> // Using "L298N" library found through arduino library manager developed by Andrea Lombardo (https://github.com/AndreaLombardo/L298N)
+#include <Arduino.h>
+#include <math.h>
 
-// ************************************************************************************************* //
-// ************************************************************************************************* //
-// Change Robot Settings here
+// =================================================================================================
+// ADJUSTABLE SETTINGS: change these during calibration and robot testing.
+// Hardware pins are in a separate section and should change only when the robot is rewired.
 
-#define PRINTALLDATA       0// Turn to 1  to prints ALL the data when changed to 1, Could be useful for debugging =)
-                                // !! Turn to 0 when running robot untethered
-#define NOMINALSPEED        255// This is the base speed for both motors, can also be increased by using potentiometers
+// --- SENSOR CALIBRATION ---------------------------------------------------------------------------
 
-// ************************************************************************************************* //
+// More measurements reject noise but make calibration slower. Suggested range: 10-50.
+const int CALIBRATION_MEASUREMENTS = 20;
 
-// ****** DECLARE PINS HERE  ****** 
+// Pause between white and black calibration. Increase if more setup time is needed.
+const unsigned long CALIBRATION_COLOR_CHANGE_MS = 2000;
 
-// Taken from LEFT TO RIGHT of the robot ****** Orient yourself so that you are looking from the rear of the robot (photoresistors are farthest away from you, wheels are closest to you)
+// Minimum absolute raw ADC difference between calibrated white and black.
+// Raise to reject poorly calibrated sensors; lower only if all real sensor spans are small.
+// Suggested starting range: 30-150 ADC counts.
+const float MIN_CALIBRATION_SPAN = 50.0f;
 
-enum side {LEFT, RIGHT};
+// Normalized 0-100 value that means a sensor sees black.
+// Raise if the floor causes false black readings; lower if the robot loses a faint black line.
+// Suggested starting range: 20-45.
+const int BLACK_DETECTION_THRESHOLD = 30;
 
-int LDR_Pin[] = {1, 2, 3, 4, 5, 6, 7}; // SET PINS CONNECTED TO PHOTORESISTORS // FROM LEFT TO RIGHT OF THE ROBOT, ROBOT IS ORIENTED WHERE PHOTORESISOTRS FARTHEST FROM YOU AND WHEELS ARE CLOSEST TO YOU      
+// A strong peak should exceed the sensor-array average by this ratio.
+// Raise to demand a clearer/narrower line; lower for wide or low-contrast lines.
+const float PEAK_TO_AVERAGE_RATIO = 1.50f;
 
-int M1H = 45;
-int M1L = 46;
-int M2H = 43;
-int M2L = 44;
+// Used to judge how many sensors simultaneously see black.
+const int ACTIVE_SENSOR_THRESHOLD = 30;
+const int MAX_EXPECTED_ACTIVE_SENSORS = 5;
 
-// Potentiometer Pins
-const int S_pin = 10; // Pin connected to Speed potentiometer
-const int P_pin = 11; // Pin connected to P term potentiometer
-const int I_pin = 12; // Pin connected to I term potentiometer
-const int D_pin = 13; // Pin connected to D term potentiometer
-                                                                 
-int led_Pins[] = {17};  // LEDs to indicate what part of calibration you're on and to illuminate the photoresistors
+// Minimum summed normalized signal around the strongest sensor.
+const float MIN_LOCAL_LINE_ENERGY = 35.0f;
 
-// ****** DECLARE Variables HERE  ****** 
+// Maximum plausible change in calculated line position from one 10 ms control sample to the next.
+const float MAX_ERROR_JUMP = 2.25f;
 
-//Variables Potentiometer Reading
-int SpRead = 0; // speed increase
-int kPRead = 0; // proportional gain
-int kIRead = 0; // integral gain
-int kDRead = 0; // derivative gain
+// --- POTENTIOMETER GAIN RANGES --------------------------------------------------------------------
 
-// Variables for Calibration and Error Calculation
-float Mn[20]; 
-float Mx[20];
-float LDRf[20];
-int LDR[20];    
-int rawPResistorData[20];  
-int totalPhotoResistors = sizeof(LDR_Pin) / sizeof(LDR_Pin[0]);  
-int numLEDs = sizeof(led_Pins) / sizeof(led_Pins[0]); 
-int MxRead, MxIndex, CriteriaForMax;
-int leftHighestPR, highestPResistor, rightHighestPR;
-float AveRead, WeightedAve;   
+// The old Kp range reached 100, which could request about 300 PWM at maximum line error.
+// With MAX_TURN=160 and error near 3, Kp around 53 already uses the entire turn budget.
+const float KP_MIN = 0.0f;
+const float KP_MAX = 50.0f;
 
-// For Motor Control
-int M1SpeedtoMotor, M2SpeedtoMotor;
-int Turn, M1P = 0, M2P = 0;
-float error, lasterror = 0, sumerror = 0;
-float kP, kI, kD;
+// The PID uses error-seconds for its integral, so this range is meaningful at any loop rate.
+// Raise KI_MAX only if the I knob cannot remove a persistent left/right bias.
+const float KI_MIN = 0.0f;
+const float KI_MAX = 12.0f;
 
+// The PID derivative is error-per-second. Raise KD_MAX if the D knob cannot damp oscillation;
+// lower it if a small knob movement makes steering noisy.
+const float KD_MIN = 0.0f;
+const float KD_MAX = 1.50f;
 
-String whitevals = "White: ";
+// Smooths ADC noise from all four potentiometers. Higher reacts faster but is noisier.
+// Suggested range: 0.05-0.30.
+const float POTENTIOMETER_FILTER_ALPHA = 0.15f;
 
-String blackvals = "Black: ";
+// Treat the bottom of a PID potentiometer as exactly zero despite ADC noise.
+const int POTENTIOMETER_ZERO_DEAD_ZONE_ADC = 30;
 
+// --- PID, SPEED, AND STEERING ---------------------------------------------------------------------
 
-String deltavals = "Delta: ";
+// Fixed control timing makes Ki and Kd repeatable. Suggested range: 5-20 ms.
+const unsigned long CONTROL_INTERVAL_MS = 10;
 
+// Starting forward PWM plus 0-SPEED_POT_ADDITION_MAX from the speed potentiometer.
+// Increase gradually. Lower speeds make calibration and traceback safer.
+const int NOMINAL_SPEED = 110;
+const int SPEED_POT_ADDITION_MAX = 100;
+const int MAX_REQUESTED_CRUISE_SPEED = 220;
 
-// ************************************************************************************************* //
-// setup - runs once
+// At low confidence the robot retains this fraction of requested cruise speed.
+// Lower for caution; raise if the robot stalls before it can correct.
+const float LOW_CONFIDENCE_SPEED_SCALE = 0.35f;
+const float FULL_CONFIDENCE_SPEED_SCALE = 1.00f;
 
-int reading = 0;
+// Absolute PID steering correction in PWM units.
+const float MAX_TURN = 160.0f;
 
-void setup() {
-  Serial.begin(9600);                            // For serial communication set up
-  ledcAttach(M1H, 12000, 8);  // 12 kHz PWM, 8-bit resolution
-  ledcAttach(M1L, 12000, 8);
-  ledcAttach(M2H, 12000, 8);
-  ledcAttach(M2L, 12000, 8);
-  for (int i = 0; i < numLEDs; i++)
-    pinMode(led_Pins[i], OUTPUT);                // Initialize all LEDs to output
-  
-  Calibrate();                                   // Calibrate black and white sensing
-      for (int i = 0; i < totalPhotoResistors; i++)
-      whitevals += String(Mn[i]) + " ";  // Store the White values that will be used by the robot
-    
-    for (int i = 0; i < totalPhotoResistors; i++)
-      blackvals += String(Mx[i]) + " ";  // Store the Black values that will be used by the robot
-  
-    for (int i = 0; i < totalPhotoResistors; i++)
-      deltavals += String(Mx[i] - Mn[i]) + " ";  // Print the Difference between the White and Black valuess
+// Maximum change in steering correction per second. Lower makes steering smoother but slower.
+const float MAX_TURN_CHANGE_PER_SECOND = 1200.0f;
 
-    ReadPotentiometers();                          // Read potentiometer values (Sp, P, I, & D)
-} // end setup()
+// Maximum accumulated error-seconds. Lower reduces windup and long-lasting steering bias.
+const float INTEGRAL_ERROR_LIMIT = 3.0f;
 
+// Derivative low-pass time constant. Raise to reduce noise; lower for a faster D response.
+const float DERIVATIVE_FILTER_TIME_CONSTANT_SECONDS = 0.040f;
 
+// --- CONFIDENCE -----------------------------------------------------------------------------------
 
-// ************************************************************************************************* //
-// loop - runs/loops forever
-void loop() {
-  ReadPotentiometers(); // Read potentiometers
+// Confidence below this value uses the minimum speed scale. It does NOT trigger traceback while
+// any photoresistor still sees black.
+const float MIN_LINE_CONFIDENCE = 0.60f;
 
-  ReadPhotoResistors(); // Read photoresistors 
+// PID must be reasonable for this many consecutive cycles to earn full PID-history confidence.
+const int PID_CHECKS_FOR_FULL_CONFIDENCE = 6;
 
-  CalcError();          // Calculates error
+// A very large raw PID request reduces confidence before output limiting.
+const float MAX_RAW_PID_TURN_FOR_CONFIDENCE = 220.0f;
 
-  PID_Turn();           // PID Control and Output to motors to turn
+// Maximum error velocity considered stable for the PID-history confidence check.
+const float MAX_ERROR_RATE_FOR_STABLE_PID = 150.0f;
 
-  RunMotors();          // Runs motors
-  
-  if (PRINTALLDATA)     // If PRINTALLDATA Enabled, Print all the data
-    Print();         
-} // end loop()
+// Confidence is earned weight / completed weight. These do not have to total exactly one.
+const float WEIGHT_CALIBRATION = 0.10f;
+const float WEIGHT_PEAK = 0.20f;
+const float WEIGHT_CONTRAST = 0.15f;
+const float WEIGHT_ACTIVE_SENSOR_COUNT = 0.10f;
+const float WEIGHT_LOCAL_ENERGY = 0.10f;
+const float WEIGHT_ERROR_CONTINUITY = 0.10f;
+const float WEIGHT_PID_OUTPUT = 0.10f;
+const float WEIGHT_PID_HISTORY = 0.15f;
 
+// --- TRACEBACK ------------------------------------------------------------------------------------
 
+// Three no-black samples at a 10 ms control interval confirm complete line loss.
+const int LINE_LOST_CONFIRMATION_SAMPLES = 3;
 
+// Require two black samples after traceback before normal PID control resumes.
+const int LINE_REACQUIRE_CONFIRMATION_SAMPLES = 2;
 
+// Store one averaged post-PID motor action every 20 ms. 16 actions cover about 320 ms.
+const int MOTION_HISTORY_SIZE = 16;
+const unsigned long MOTION_ACTION_INTERVAL_MS = 20;
 
+// Stop before changing from forward to reverse to reduce current and mechanical shock.
+const unsigned long TRACEBACK_SETTLE_MS = 60;
 
-// ************************************************************************************************* //
-// function to calibrate
+// Traceback keeps the stored left/right steering ratio but scales both if either exceeds this PWM.
+const int TRACEBACK_MAX_PWM = 160;
 
-void Calibrate() {
+// Reverse command slew rate after the stopped settling period.
+const float TRACEBACK_PWM_CHANGE_PER_SECOND = 4000.0f;
 
-  int numberOfMeasurements = 20;                // set number Of Measurements to take
+// --- TELEMETRY AND OPTIONAL SCOPE OUTPUTS ---------------------------------------------------------
 
-  CalibrateHelper(numberOfMeasurements, false); // White Calibration
+// Serial Plotter is the recommended tuning tool. At 115200 baud, 20 Hz telemetry is non-blocking
+// enough for this controller. Turn it off for final untethered speed tests.
+const bool ENABLE_SERIAL_TELEMETRY = true;
+const unsigned long TELEMETRY_INTERVAL_MS = 50;
+const unsigned long SERIAL_BAUD_RATE = 115200;
 
-  setLeds(0);                                   // Turn off LEDs to indicate user to calibrate other color
-  delay(2000);
-  
-  CalibrateHelper(numberOfMeasurements, true);  // Black Calibration
+// Optional scope PWM outputs are disabled until unused, output-capable GPIOs are assigned.
+// After an RC filter: 0 V = negative full scale, ~1.65 V = zero, ~3.3 V = positive full scale.
+const bool ENABLE_SCOPE_DEBUG = false;
+const int SCOPE_ERROR_PIN = -1;
+const int SCOPE_TURN_PIN = -1;
+const int SCOPE_SYNC_PIN = -1;
+const int SCOPE_PWM_FREQUENCY = 2000;
+const int SCOPE_PWM_RESOLUTION_BITS = 8;
 
-  Serial.print("White Vals:  ");
-  for (int i = 0; i < totalPhotoResistors; i++)
-    Serial.print(String(Mn[i]) + " ");          // Print the White values that will be used by the robot
-  Serial.println();
+// =================================================================================================
+// HARDWARE SETTINGS: do not change these during normal calibration.
 
-  Serial.print("Black Vals:  ");
-  for (int i = 0; i < totalPhotoResistors; i++)
-    Serial.print(String(Mx[i]) + " ");          // Print the Black values that will be used by the robot
-  Serial.println();
+enum MotorSide { LEFT_MOTOR, RIGHT_MOTOR };
 
-  Serial.print("Delta Vals:  ");
-  for (int i = 0; i < totalPhotoResistors; i++)
-    Serial.print(String(Mx[i] - Mn[i]) + " ");  // Print the Difference between the White and Black valuess
-  Serial.println();
+const int LDR_PINS[] = {1, 2, 3, 4, 5, 6, 7};
+const int SENSOR_COUNT = sizeof(LDR_PINS) / sizeof(LDR_PINS[0]);
 
-  setLeds(1);                                   // Turn LEDs on
-  delay(2000);
+const int M1H = 45;
+const int M1L = 46;
+const int M2H = 43;
+const int M2L = 44;
 
-} // end Calibrate()
+const int SPEED_POT_PIN = 10;
+const int P_POT_PIN = 11;
+const int I_POT_PIN = 12;
+const int D_POT_PIN = 13;
 
-void CalibrateHelper(int numberOfMeasurements, boolean ifCalibratingBlack) {
-  
-  if (ifCalibratingBlack)
-    Serial.println("\nCalibrating Black");
-  else
-    Serial.println("\nCalibrating White");
-// Indicate that calibration is starting
-  for (int i = 0; i < 4; i++) {
-      setLeds(1); // turn the LEDs on
-      delay(250); // wait
-      setLeds(0); // turn the LEDs off
-      delay(250); // wait 
+const int LED_PINS[] = {17};
+const int LED_COUNT = sizeof(LED_PINS) / sizeof(LED_PINS[0]);
+
+const int MOTOR_PWM_FREQUENCY = 12000;
+const int MOTOR_PWM_RESOLUTION_BITS = 8;
+
+// =================================================================================================
+// Runtime state. These values are not calibration settings.
+
+enum ControlState {
+  STATE_TRACKING = 0,
+  STATE_LOSS_PENDING = 1,
+  STATE_TRACEBACK_SETTLE = 2,
+  STATE_TRACEBACK = 3,
+  STATE_REACQUIRE_VERIFY = 4,
+  STATE_RECOVERY_FAILED = 5
+};
+
+struct MotionAction {
+  int leftPwm;
+  int rightPwm;
+  unsigned int durationMs;
+};
+
+struct ConfidenceAccumulator {
+  float earnedWeight;
+  float completedWeight;
+  int checksPassed;
+  int checksCompleted;
+};
+
+float calibrationWhite[SENSOR_COUNT] = {0};
+float calibrationBlack[SENSOR_COUNT] = {0};
+float calibrationAccumulator[SENSOR_COUNT] = {0};
+int rawLdr[SENSOR_COUNT] = {0};
+int normalizedLdr[SENSOR_COUNT] = {0};
+
+float filteredSpeedAdc = 0.0f;
+float filteredPAdc = 0.0f;
+float filteredIAdc = 0.0f;
+float filteredDAdc = 0.0f;
+bool potentiometersInitialized = false;
+
+int speedPotAddition = 0;
+float kP = 0.0f;
+float kI = 0.0f;
+float kD = 0.0f;
+
+float lineError = 0.0f;
+float previousPidError = 0.0f;
+float previousValidLineError = 0.0f;
+float integralError = 0.0f;
+float filteredDerivative = 0.0f;
+float pTerm = 0.0f;
+float iTerm = 0.0f;
+float dTerm = 0.0f;
+float rawTurn = 0.0f;
+float appliedTurn = 0.0f;
+bool hasPidErrorHistory = false;
+bool hasPreviousValidLineError = false;
+bool turnWasLimited = false;
+bool outputWasSaturated = false;
+
+int validCalibrationCount = 0;
+int activeSensorCount = 0;
+int peakSensorIndex = 0;
+int peakSensorValue = 0;
+bool blackDetected = false;
+bool hasCandidateError = false;
+
+ConfidenceAccumulator confidenceAccumulator = {0.0f, 0.0f, 0, 0};
+float sensorConfidence = 0.0f;
+float lineConfidence = 0.0f;
+int consecutivePidChecks = 0;
+
+int baseSpeed = 0;
+int leftMotorSpeed = 0;
+int rightMotorSpeed = 0;
+
+ControlState controlState = STATE_TRACKING;
+ControlState reacquireReturnState = STATE_TRACEBACK;
+unsigned long stateEnteredMs = 0;
+int consecutiveLostSamples = 0;
+int consecutiveReacquiredSamples = 0;
+
+MotionAction motionHistory[MOTION_HISTORY_SIZE];
+int motionHistoryWriteIndex = 0;
+int motionHistoryCount = 0;
+
+long motionWindowLeftSum = 0;
+long motionWindowRightSum = 0;
+int motionWindowSampleCount = 0;
+unsigned long motionWindowStartedMs = 0;
+bool motionWindowActive = false;
+
+int tracebackReadIndex = 0;
+int tracebackActionsRemaining = 0;
+bool tracebackActionLoaded = false;
+bool tracebackActionTiming = false;
+int tracebackTargetLeft = 0;
+int tracebackTargetRight = 0;
+unsigned long tracebackActionStartedMs = 0;
+unsigned long tracebackActionDurationMs = 0;
+
+unsigned long lastControlMs = 0;
+unsigned long lastTelemetryMs = 0;
+
+// =================================================================================================
+// General helpers.
+
+float clampFloat(float value, float minimum, float maximum) {
+  if (value < minimum) return minimum;
+  if (value > maximum) return maximum;
+  return value;
+}
+
+int clampInt(int value, int minimum, int maximum) {
+  if (value < minimum) return minimum;
+  if (value > maximum) return maximum;
+  return value;
+}
+
+const char *stateName(ControlState state) {
+  switch (state) {
+    case STATE_TRACKING: return "TRACKING";
+    case STATE_LOSS_PENDING: return "LOSS_PENDING";
+    case STATE_TRACEBACK_SETTLE: return "TRACEBACK_SETTLE";
+    case STATE_TRACEBACK: return "TRACEBACK";
+    case STATE_REACQUIRE_VERIFY: return "REACQUIRE_VERIFY";
+    case STATE_RECOVERY_FAILED: return "RECOVERY_FAILED";
+    default: return "UNKNOWN";
   }
-  
+}
+
+void setLeds(int value) {
+  for (int i = 0; i < LED_COUNT; i++) digitalWrite(LED_PINS[i], value);
+}
+
+void setControlState(ControlState nextState, unsigned long nowMs) {
+  controlState = nextState;
+  stateEnteredMs = nowMs;
+}
+
+// =================================================================================================
+// Motor output.
+
+void runMotorAtSpeed(MotorSide side, int speed) {
+  int boundedSpeed = clampInt(speed, -255, 255);
+
+  if (side == LEFT_MOTOR) {
+    if (boundedSpeed > 0) {
+      ledcWrite(M1H, boundedSpeed);
+      ledcWrite(M1L, 0);
+    } else {
+      ledcWrite(M1H, 0);
+      ledcWrite(M1L, abs(boundedSpeed));
+    }
+  } else {
+    if (boundedSpeed > 0) {
+      ledcWrite(M2H, boundedSpeed);
+      ledcWrite(M2L, 0);
+    } else {
+      ledcWrite(M2H, 0);
+      ledcWrite(M2L, abs(boundedSpeed));
+    }
+  }
+}
+
+void applyMotorSpeeds(int logicalLeftSpeed, int logicalRightSpeed) {
+  leftMotorSpeed = clampInt(logicalLeftSpeed, -255, 255);
+  rightMotorSpeed = clampInt(logicalRightSpeed, -255, 255);
+
+  // Preserve the original sketch's physical motor-to-pin orientation.
+  runMotorAtSpeed(LEFT_MOTOR, rightMotorSpeed);
+  runMotorAtSpeed(RIGHT_MOTOR, leftMotorSpeed);
+}
+
+void stopMotors() {
+  applyMotorSpeeds(0, 0);
+  baseSpeed = 0;
+}
+
+int slewInteger(int current, int target, float ratePerSecond, float dtSeconds) {
+  int maximumStep = max(1, (int)roundf(ratePerSecond * dtSeconds));
+  if (target > current + maximumStep) return current + maximumStep;
+  if (target < current - maximumStep) return current - maximumStep;
+  return target;
+}
+
+// =================================================================================================
+// Calibration and analog input.
+
+void calibrateColor(bool calibratingBlack) {
+  Serial.println(calibratingBlack ? "\nCalibrating black" : "\nCalibrating white");
+
+  for (int blink = 0; blink < 4; blink++) {
+    setLeds(1);
+    delay(250);
+    setLeds(0);
+    delay(250);
+  }
+
   setLeds(1);
   delay(250);
 
-  for (int i = 0; i < numberOfMeasurements; i++) {
-    for (int pin = 0; pin < totalPhotoResistors; pin++) {
-      LDRf[pin] = LDRf[pin] + (float)analogRead(LDR_Pin[pin]);
+  for (int measurement = 0; measurement < CALIBRATION_MEASUREMENTS; measurement++) {
+    for (int sensor = 0; sensor < SENSOR_COUNT; sensor++) {
+      calibrationAccumulator[sensor] += (float)analogRead(LDR_PINS[sensor]);
       delay(2);
     }
     Serial.print(". ");
   }
-  for (int pin = 0; pin < totalPhotoResistors; pin++) {
-    if (ifCalibratingBlack) {                                   // updating cooresponding array based on if we are calibrating black or white
-      Mx[pin] = round(LDRf[pin] / (float)numberOfMeasurements); // take average and store for black
-    }
-    else {
-      Mn[pin] = round(LDRf[pin] / (float)numberOfMeasurements); // take average and store for white
-    }
-    LDRf[pin] = 0.0;
+
+  for (int sensor = 0; sensor < SENSOR_COUNT; sensor++) {
+    float average = roundf(calibrationAccumulator[sensor] / (float)CALIBRATION_MEASUREMENTS);
+    if (calibratingBlack) calibrationBlack[sensor] = average;
+    else calibrationWhite[sensor] = average;
+    calibrationAccumulator[sensor] = 0.0f;
   }
 
-  Serial.println(" Done!");
+  Serial.println("Done!");
   setLeds(0);
   delay(250);
 }
 
-// Set all LEDs to a certain brightness
-void setLeds(int x) {
-  for (int i = 0; i < numLEDs; i++)
-    digitalWrite(led_Pins[i], x);
+void printCalibrationValues() {
+  Serial.print("White values: ");
+  for (int sensor = 0; sensor < SENSOR_COUNT; sensor++) {
+    Serial.print(calibrationWhite[sensor]);
+    Serial.print(' ');
+  }
+  Serial.println();
+
+  Serial.print("Black values: ");
+  for (int sensor = 0; sensor < SENSOR_COUNT; sensor++) {
+    Serial.print(calibrationBlack[sensor]);
+    Serial.print(' ');
+  }
+  Serial.println();
+
+  Serial.print("Absolute spans: ");
+  for (int sensor = 0; sensor < SENSOR_COUNT; sensor++) {
+    Serial.print(fabsf(calibrationBlack[sensor] - calibrationWhite[sensor]));
+    Serial.print(' ');
+  }
+  Serial.println();
 }
 
-// **********Recall your Challenge #1 Code********************************************************************** //
-// function to read and map values from potentiometers
-void ReadPotentiometers() {
-  // Call on user-defined function to read Potentiometer values
-  SpRead = ReadPotentiometerHelper(S_pin, 0, 4095, 0, 100); // We want to read a potentiometer for S_pin with resolution from 0 to 1023 and potentiometer range from 0 to 100.
-  kPRead = ReadPotentiometerHelper(P_pin, 0, 4095, 0, 100); // We want to read a potentiometer for P_pin with resolution from 0 to 1023 and potentiometer range from 0 to 100.
-  kIRead = ReadPotentiometerHelper(I_pin, 0, 4095, 0, 100); // We want to read a potentiometer for I_pin with resolution from 0 to 1023 and potentiometer range from 0 to 100.
-  kDRead = ReadPotentiometerHelper(D_pin, 0, 4095, 0, 100); // We want to read a potentiometer for D_pin with resolution from 0 to 1023 and potentiometer range from 0 to 100.
-
-} // end ReadPotentiometers()
-
-int ReadPotentiometerHelper(int pin, int min_resolution, int max_resolution, int min_potentiometer, int max_potentiometer) {
-  return map(analogRead(pin), min_resolution, max_resolution, min_potentiometer, max_potentiometer); 
+void calibrateSensors() {
+  calibrateColor(false);
+  setLeds(0);
+  delay(CALIBRATION_COLOR_CHANGE_MS);
+  calibrateColor(true);
+  printCalibrationValues();
+  setLeds(1);
+  delay(CALIBRATION_COLOR_CHANGE_MS);
 }
 
-// **********Recall your Challenge #2 Code********************************************************************** //
-// Function to read photo resistors and map from 0 to 100
-void ReadPhotoResistors() {
-  for (int i = 0; i < totalPhotoResistors; i++) { 
-    rawPResistorData[i] = analogRead(LDR_Pin[i]);
-    LDR[i] = map(rawPResistorData[i], Mn[i], Mx[i], 0, 100); // Mn and Mx are created from calibration Min and Max for each pin
-  }    
+float updateFilteredAdc(float previousValue, int rawValue) {
+  return previousValue + POTENTIOMETER_FILTER_ALPHA * ((float)rawValue - previousValue);
+}
 
-} // end ReadPhotoResistors()
+float adcFractionWithDeadZone(float adcValue, bool useZeroDeadZone) {
+  float lowerBound = useZeroDeadZone ? (float)POTENTIOMETER_ZERO_DEAD_ZONE_ADC : 0.0f;
+  if (adcValue <= lowerBound) return 0.0f;
+  return clampFloat((adcValue - lowerBound) / (4095.0f - lowerBound), 0.0f, 1.0f);
+}
 
+float mapFractionToRange(float fraction, float minimum, float maximum) {
+  return minimum + clampFloat(fraction, 0.0f, 1.0f) * (maximum - minimum);
+}
 
-// **********Recall your Challenge #3 Code********************************************************************** //
-// function to start motors using nominal speed + speed addition from potentiometer
-void RunMotors() {
-  M1SpeedtoMotor = min(max(NOMINALSPEED + SpRead + M1P,-255), 255); 
-  M2SpeedtoMotor = min(max(NOMINALSPEED + SpRead + M2P,-255), 255); // remember M1Sp & M2Sp is defined at beginning of code (default 60)
-  
-  runMotorAtSpeed(LEFT, M2SpeedtoMotor); // run right motor 
-  runMotorAtSpeed(RIGHT, M1SpeedtoMotor); // run left motor
-} // end RunMotors()
+void readPotentiometers() {
+  int rawSpeed = analogRead(SPEED_POT_PIN);
+  int rawP = analogRead(P_POT_PIN);
+  int rawI = analogRead(I_POT_PIN);
+  int rawD = analogRead(D_POT_PIN);
 
-// A function that commands a specified motor to move towards a given direction at a given speed
-void runMotorAtSpeed(side _side, int speed) {
-  if (_side == LEFT) {
-    if (speed > 0)         {       // swap direction if speed is negative
-      ledcWrite(M1H, speed);
-      ledcWrite(M1L, 0);          // sets the direction of the motor from arguments
+  if (!potentiometersInitialized) {
+    filteredSpeedAdc = (float)rawSpeed;
+    filteredPAdc = (float)rawP;
+    filteredIAdc = (float)rawI;
+    filteredDAdc = (float)rawD;
+    potentiometersInitialized = true;
   } else {
-      ledcWrite(M1H, 0);
-      ledcWrite(M1L, abs(speed)); // sets the direction of the motor from arguments
+    filteredSpeedAdc = updateFilteredAdc(filteredSpeedAdc, rawSpeed);
+    filteredPAdc = updateFilteredAdc(filteredPAdc, rawP);
+    filteredIAdc = updateFilteredAdc(filteredIAdc, rawI);
+    filteredDAdc = updateFilteredAdc(filteredDAdc, rawD);
   }
-  }
-  if (_side == RIGHT) {
-    if (speed > 0)  {              // swap direction if speed is negative
-      ledcWrite(M2H, speed);
-      ledcWrite(M2L, 0); // sets the direction of the motor from arguments
-  } else {
-      ledcWrite(M2H, 0);
-      ledcWrite(M2L, abs(speed)); // sets the direction of the motor from arguments
-  }
-  }
+
+  speedPotAddition = (int)roundf(
+    adcFractionWithDeadZone(filteredSpeedAdc, false) * (float)SPEED_POT_ADDITION_MAX
+  );
+  kP = mapFractionToRange(adcFractionWithDeadZone(filteredPAdc, true), KP_MIN, KP_MAX);
+  kI = mapFractionToRange(adcFractionWithDeadZone(filteredIAdc, true), KI_MIN, KI_MAX);
+  kD = mapFractionToRange(adcFractionWithDeadZone(filteredDAdc, true), KD_MIN, KD_MAX);
 }
 
+void readPhotoresistors() {
+  for (int sensor = 0; sensor < SENSOR_COUNT; sensor++) {
+    rawLdr[sensor] = analogRead(LDR_PINS[sensor]);
+    float span = calibrationBlack[sensor] - calibrationWhite[sensor];
 
-
-// ************************************************************************************************* //
-// Calculate error from photoresistor readings
-void CalcError() {
-  MxRead = -99;
-  AveRead = 0.0;
-  for (int i = 0; i < totalPhotoResistors; i++) { // This loop goes through each photoresistor and stores the photoresistor with the highest value to the variable 'highestPResistor'
-    if (MxRead < LDR[i]) {
-      MxRead = LDR[i];
-      MxIndex = -1 * (i - 3);
-      highestPResistor = (float)i;
+    if (fabsf(span) < MIN_CALIBRATION_SPAN) {
+      normalizedLdr[sensor] = 0;
+      continue;
     }
-    AveRead = AveRead + (float)LDR[i] / (float)totalPhotoResistors;
+
+    // Signed span supports either electrical polarity: calibrated black always maps toward 100.
+    float normalized = 100.0f * ((float)rawLdr[sensor] - calibrationWhite[sensor]) / span;
+    normalizedLdr[sensor] = (int)roundf(clampFloat(normalized, 0.0f, 100.0f));
   }
-  
-  CriteriaForMax = 1.5; 
-  if (MxRead > CriteriaForMax * AveRead) { // Make sure that the highestPResistor is actually "seeing" a line. What happens if there is no line and we take the photoresistor that happens to have the highest value?
+}
 
-    // Next we assign variables to hold the index of the left and right Photoresistor that has the highest value, though we have to make sure that we aren't checking a Photoresistor that doesn't exist.
-    // Ex: To the left of the left most photoresistor or the right of the right most photoresistor
-    if (highestPResistor != 0)
-      leftHighestPR = highestPResistor - 1;
-    else
-      leftHighestPR = highestPResistor;
+// =================================================================================================
+// Confidence and line-position calculation.
 
-    if (highestPResistor != totalPhotoResistors - 1)
-      rightHighestPR = highestPResistor + 1;
-    else
-      rightHighestPR = highestPResistor;
+void resetConfidenceAccumulator() {
+  confidenceAccumulator.earnedWeight = 0.0f;
+  confidenceAccumulator.completedWeight = 0.0f;
+  confidenceAccumulator.checksPassed = 0;
+  confidenceAccumulator.checksCompleted = 0;
+}
 
-    // Next we take the percentage of "line" each of our left, middle, and right photoresistors sees and then we take the average, which is our error calculation
-    float numerator = (float)(LDR[leftHighestPR] * leftHighestPR) + (float)(LDR[highestPResistor] * highestPResistor) + (float)(LDR[rightHighestPR] * rightHighestPR);
-    float denominator = (float)LDR[leftHighestPR] + (float)LDR[highestPResistor] + (float)LDR[rightHighestPR];
+void addConfidenceScore(bool completed, float score, float weight) {
+  if (!completed) return;
 
-    WeightedAve = ((float)numerator) / denominator;
+  float boundedScore = clampFloat(score, 0.0f, 1.0f);
+  confidenceAccumulator.completedWeight += weight;
+  confidenceAccumulator.earnedWeight += boundedScore * weight;
+  confidenceAccumulator.checksCompleted++;
+  if (boundedScore >= 0.999f) confidenceAccumulator.checksPassed++;
+}
 
-    error = (WeightedAve - totalPhotoResistors/2);
-  }
-  
-} // end CalcError()
+void addConfidenceCheck(bool completed, bool passed, float weight) {
+  addConfidenceScore(completed, passed ? 1.0f : 0.0f, weight);
+}
 
-// ************************************************************************************************* //
-// PID Function
-void PID_Turn() {
-  kP = (float)kPRead * 1.;    // each of these scaling factors can change depending on how influential you want them to be
-  kI = (float)kIRead * 0.001;
-  kD = (float)kDRead * 0.01;
+float currentConfidence() {
+  if (confidenceAccumulator.completedWeight <= 0.0f) return 0.0f;
+  return clampFloat(
+    confidenceAccumulator.earnedWeight / confidenceAccumulator.completedWeight,
+    0.0f,
+    1.0f
+  );
+}
 
-  Turn = error * kP + sumerror * kI + (error - lasterror) * kD; // PID!!!!!!!!!!!!!
+void calculateLineErrorAndSensorConfidence() {
+  resetConfidenceAccumulator();
+  blackDetected = false;
+  hasCandidateError = false;
+  validCalibrationCount = 0;
+  activeSensorCount = 0;
+  peakSensorIndex = 0;
+  peakSensorValue = -1;
 
-  if (sumerror > 5)   // prevents integrator wind-up
-    sumerror = 5;
-  else if (sumerror < -5)
-    sumerror = -5;
+  float average = 0.0f;
+  float totalSignal = 0.0f;
+  float weightedPositionSum = 0.0f;
 
-  if (error == 0)     // Reset sumerror if line is centered
-    sumerror = 0;
+  for (int sensor = 0; sensor < SENSOR_COUNT; sensor++) {
+    float span = fabsf(calibrationBlack[sensor] - calibrationWhite[sensor]);
+    bool calibrationValid = span >= MIN_CALIBRATION_SPAN;
+    if (calibrationValid) validCalibrationCount++;
 
-  if (Turn < 0) {
-    M1P = -Turn;       // One motor becomes slower and the other faster
-    M2P = Turn;
-  }
-  else if (Turn > 0) {
-    M1P = -Turn;
-    M2P = Turn;
-  }
-  else {
-    M1P = 0;
-    M2P = 0;
-  }
+    int value = normalizedLdr[sensor];
+    average += (float)value / (float)SENSOR_COUNT;
+    totalSignal += (float)value;
+    weightedPositionSum += (float)value * (float)sensor;
 
-  lasterror = error;
-  sumerror = sumerror + error;
-
-} // end PID_Turn()
-
-// ************************************************************************************************* //
-// function to print values of interest
-void Print() {
-  Serial.print(" Sp: " + String(SpRead) + " P: " + String(kP) + " I: " + String(kI) + " D: " + String(kD) + "  PResistor Val : "); // Prints PID settings
-
-  for (int i = 0; i < totalPhotoResistors; i++) { // Printing the photo resistor reading values one by one
-    Serial.print(LDR[i]);
-    //Serial.print(rawPResistorData[i]); //Uncomment this if you would prefer to see raw photoresistor readings
-    Serial.print(" ");
+    if (value > peakSensorValue) {
+      peakSensorValue = value;
+      peakSensorIndex = sensor;
+    }
+    if (value >= ACTIVE_SENSOR_THRESHOLD) activeSensorCount++;
+    if (calibrationValid && value >= BLACK_DETECTION_THRESHOLD) blackDetected = true;
   }
 
-  Serial.print(" Error: " + String(error));      // this will show the calculated error (-3 through 3)
+  addConfidenceScore(
+    true,
+    (float)validCalibrationCount / (float)SENSOR_COUNT,
+    WEIGHT_CALIBRATION
+  );
+  addConfidenceCheck(true, peakSensorValue >= BLACK_DETECTION_THRESHOLD, WEIGHT_PEAK);
+  addConfidenceCheck(
+    true,
+    average > 0.0f && (float)peakSensorValue >= PEAK_TO_AVERAGE_RATIO * average,
+    WEIGHT_CONTRAST
+  );
+  addConfidenceCheck(
+    true,
+    activeSensorCount >= 1 && activeSensorCount <= MAX_EXPECTED_ACTIVE_SENSORS,
+    WEIGHT_ACTIVE_SENSOR_COUNT
+  );
 
-  Serial.println("  LMotor:  " + String(M1SpeedtoMotor) + "  RMotor:  " + String(M2SpeedtoMotor));    // This prints the arduino output to each motor so you can see what the values are (0-255)
-  setLeds(0); 
-  delay(100);                                    // just here to slow down the output for easier reading. Don't comment out or else it'll slow down the processor on the arduino
-  setLeds(1); 
-  delay(100); 
+  int firstNeighbor = max(0, peakSensorIndex - 1);
+  int lastNeighbor = min(SENSOR_COUNT - 1, peakSensorIndex + 1);
+  float localEnergy = 0.0f;
+  for (int sensor = firstNeighbor; sensor <= lastNeighbor; sensor++) {
+    localEnergy += (float)normalizedLdr[sensor];
+  }
+  addConfidenceCheck(true, localEnergy >= MIN_LOCAL_LINE_ENERGY, WEIGHT_LOCAL_ENERGY);
 
-} // end Print()
+  if (totalSignal > 0.0f) {
+    float weightedPosition = weightedPositionSum / totalSignal;
+    float candidateError = weightedPosition - ((float)(SENSOR_COUNT - 1) / 2.0f);
+    bool errorIsContinuous = !hasPreviousValidLineError
+                          || fabsf(candidateError - previousValidLineError) <= MAX_ERROR_JUMP;
+    addConfidenceCheck(
+      hasPreviousValidLineError,
+      errorIsContinuous,
+      WEIGHT_ERROR_CONTINUITY
+    );
+    lineError = candidateError;
+    hasCandidateError = true;
+  } else {
+    addConfidenceCheck(true, false, WEIGHT_ERROR_CONTINUITY);
+  }
+
+  sensorConfidence = currentConfidence();
+  lineConfidence = sensorConfidence;
+}
+
+// =================================================================================================
+// PID and confidence-based tracking control.
+
+void resetPidState() {
+  previousPidError = lineError;
+  integralError = 0.0f;
+  filteredDerivative = 0.0f;
+  pTerm = 0.0f;
+  iTerm = 0.0f;
+  dTerm = 0.0f;
+  rawTurn = 0.0f;
+  appliedTurn = 0.0f;
+  hasPidErrorHistory = false;
+  hasPreviousValidLineError = false;
+  consecutivePidChecks = 0;
+  turnWasLimited = false;
+  outputWasSaturated = false;
+}
+
+void calculatePidAndConfidence(float dtSeconds) {
+  bool pidHasInput = blackDetected && hasCandidateError;
+  float errorRate = 0.0f;
+
+  if (pidHasInput && hasPidErrorHistory && dtSeconds > 0.0f) {
+    errorRate = (lineError - previousPidError) / dtSeconds;
+  }
+
+  float derivativeAlpha = dtSeconds / (DERIVATIVE_FILTER_TIME_CONSTANT_SECONDS + dtSeconds);
+  derivativeAlpha = clampFloat(derivativeAlpha, 0.0f, 1.0f);
+  filteredDerivative += derivativeAlpha * (errorRate - filteredDerivative);
+
+  float proposedIntegral = clampFloat(
+    integralError + lineError * dtSeconds,
+    -INTEGRAL_ERROR_LIMIT,
+    INTEGRAL_ERROR_LIMIT
+  );
+
+  pTerm = pidHasInput ? lineError * kP : 0.0f;
+  dTerm = pidHasInput ? filteredDerivative * kD : 0.0f;
+  float proposedITerm = pidHasInput ? proposedIntegral * kI : 0.0f;
+  float proposedRawTurn = pTerm + proposedITerm + dTerm;
+
+  // Conditional integration: do not accumulate error if it pushes farther into saturation.
+  bool proposedHighSaturation = proposedRawTurn > MAX_TURN && lineError > 0.0f;
+  bool proposedLowSaturation = proposedRawTurn < -MAX_TURN && lineError < 0.0f;
+  if (pidHasInput && !proposedHighSaturation && !proposedLowSaturation) {
+    integralError = proposedIntegral;
+  } else if (!pidHasInput) {
+    integralError *= 0.5f;
+  }
+
+  iTerm = pidHasInput ? integralError * kI : 0.0f;
+  rawTurn = pTerm + iTerm + dTerm;
+  if (!isfinite(rawTurn)) rawTurn = 0.0f;
+
+  bool pidOutputReasonable = pidHasInput
+                          && fabsf(rawTurn) <= MAX_RAW_PID_TURN_FOR_CONFIDENCE;
+  bool pidMotionStable = pidHasInput
+                      && (!hasPidErrorHistory || fabsf(errorRate) <= MAX_ERROR_RATE_FOR_STABLE_PID);
+  addConfidenceCheck(true, pidOutputReasonable, WEIGHT_PID_OUTPUT);
+
+  if (pidOutputReasonable && pidMotionStable) {
+    if (consecutivePidChecks < PID_CHECKS_FOR_FULL_CONFIDENCE) consecutivePidChecks++;
+  } else {
+    consecutivePidChecks = 0;
+  }
+
+  float pidHistoryScore = (float)consecutivePidChecks / (float)PID_CHECKS_FOR_FULL_CONFIDENCE;
+  addConfidenceScore(true, pidHistoryScore, WEIGHT_PID_HISTORY);
+  lineConfidence = currentConfidence();
+
+  float requestedTurn = clampFloat(rawTurn, -MAX_TURN, MAX_TURN);
+  float maximumTurnStep = MAX_TURN_CHANGE_PER_SECOND * dtSeconds;
+  float turnDelta = requestedTurn - appliedTurn;
+  float limitedTurnDelta = clampFloat(turnDelta, -maximumTurnStep, maximumTurnStep);
+  appliedTurn = clampFloat(appliedTurn + limitedTurnDelta, -MAX_TURN, MAX_TURN);
+
+  turnWasLimited = fabsf(turnDelta - limitedTurnDelta) > 0.001f
+                || fabsf(rawTurn - requestedTurn) > 0.001f;
+
+  previousPidError = lineError;
+  hasPidErrorHistory = pidHasInput;
+  if (pidHasInput) {
+    previousValidLineError = lineError;
+    hasPreviousValidLineError = true;
+  }
+}
+
+void driveWithPidAndConfidence(float dtSeconds) {
+  calculatePidAndConfidence(dtSeconds);
+
+  int requestedCruiseSpeed = clampInt(
+    NOMINAL_SPEED + speedPotAddition,
+    0,
+    MAX_REQUESTED_CRUISE_SPEED
+  );
+
+  float confidenceProgress = (lineConfidence - MIN_LINE_CONFIDENCE)
+                           / (1.0f - MIN_LINE_CONFIDENCE);
+  float speedScale = LOW_CONFIDENCE_SPEED_SCALE
+                   + clampFloat(confidenceProgress, 0.0f, 1.0f)
+                   * (FULL_CONFIDENCE_SPEED_SCALE - LOW_CONFIDENCE_SPEED_SCALE);
+  int confidenceSpeed = (int)roundf((float)requestedCruiseSpeed * speedScale);
+
+  // Reserve PWM headroom for steering. This preserves left/right difference instead of clipping
+  // only the faster wheel when baseSpeed +/- appliedTurn would exceed the motor limit.
+  int maximumBaseForTurn = max(0, 255 - (int)ceilf(fabsf(appliedTurn)));
+  baseSpeed = min(confidenceSpeed, maximumBaseForTurn);
+  outputWasSaturated = confidenceSpeed > maximumBaseForTurn || fabsf(rawTurn) > MAX_TURN;
+
+  int desiredLeft = (int)roundf((float)baseSpeed - appliedTurn);
+  int desiredRight = (int)roundf((float)baseSpeed + appliedTurn);
+  applyMotorSpeeds(desiredLeft, desiredRight);
+}
+
+// =================================================================================================
+// Sixteen-action physical motion history and traceback.
+
+void clearMotionHistory() {
+  motionHistoryWriteIndex = 0;
+  motionHistoryCount = 0;
+  motionWindowLeftSum = 0;
+  motionWindowRightSum = 0;
+  motionWindowSampleCount = 0;
+  motionWindowStartedMs = 0;
+  motionWindowActive = false;
+}
+
+void storeMotionAction(int leftPwm, int rightPwm, unsigned long durationMs) {
+  if (durationMs == 0) return;
+
+  MotionAction &entry = motionHistory[motionHistoryWriteIndex];
+  entry.leftPwm = clampInt(leftPwm, -255, 255);
+  entry.rightPwm = clampInt(rightPwm, -255, 255);
+  entry.durationMs = (unsigned int)min(durationMs, 65535UL);
+
+  motionHistoryWriteIndex = (motionHistoryWriteIndex + 1) % MOTION_HISTORY_SIZE;
+  if (motionHistoryCount < MOTION_HISTORY_SIZE) motionHistoryCount++;
+}
+
+void resetMotionWindow(unsigned long nowMs) {
+  motionWindowLeftSum = 0;
+  motionWindowRightSum = 0;
+  motionWindowSampleCount = 0;
+  motionWindowStartedMs = nowMs;
+  motionWindowActive = true;
+}
+
+void finishMotionWindow(unsigned long nowMs) {
+  if (!motionWindowActive || motionWindowSampleCount <= 0) return;
+
+  unsigned long durationMs = nowMs - motionWindowStartedMs;
+  if (durationMs > 0) {
+    int averageLeft = (int)roundf((float)motionWindowLeftSum / (float)motionWindowSampleCount);
+    int averageRight = (int)roundf((float)motionWindowRightSum / (float)motionWindowSampleCount);
+    storeMotionAction(averageLeft, averageRight, durationMs);
+  }
+
+  motionWindowActive = false;
+  motionWindowSampleCount = 0;
+  motionWindowLeftSum = 0;
+  motionWindowRightSum = 0;
+}
+
+void recordTrackingMotion(unsigned long nowMs) {
+  if (!motionWindowActive) resetMotionWindow(nowMs);
+
+  // Close the previous time window before assigning the current sample to the next one. This keeps
+  // adjacent 20 ms actions contiguous instead of counting the boundary sample in the old window.
+  if (nowMs - motionWindowStartedMs >= MOTION_ACTION_INTERVAL_MS) {
+    finishMotionWindow(nowMs);
+    resetMotionWindow(nowMs);
+  }
+
+  motionWindowLeftSum += leftMotorSpeed;
+  motionWindowRightSum += rightMotorSpeed;
+  motionWindowSampleCount++;
+}
+
+void prepareTraceback(unsigned long nowMs) {
+  tracebackActionsRemaining = motionHistoryCount;
+  tracebackReadIndex = (motionHistoryWriteIndex - 1 + MOTION_HISTORY_SIZE) % MOTION_HISTORY_SIZE;
+  tracebackActionLoaded = false;
+  tracebackActionTiming = false;
+  tracebackTargetLeft = 0;
+  tracebackTargetRight = 0;
+  stopMotors();
+  setControlState(STATE_TRACEBACK_SETTLE, nowMs);
+}
+
+void loadNextTracebackAction() {
+  if (tracebackActionsRemaining <= 0) return;
+
+  const MotionAction &stored = motionHistory[tracebackReadIndex];
+  int maximumMagnitude = max(abs(stored.leftPwm), abs(stored.rightPwm));
+
+  if (maximumMagnitude == 0) {
+    tracebackTargetLeft = 0;
+    tracebackTargetRight = 0;
+    tracebackActionDurationMs = stored.durationMs;
+  } else {
+    float scale = min(1.0f, (float)TRACEBACK_MAX_PWM / (float)maximumMagnitude);
+    tracebackTargetLeft = (int)roundf(-(float)stored.leftPwm * scale);
+    tracebackTargetRight = (int)roundf(-(float)stored.rightPwm * scale);
+    // Compensate approximately for scaling the wheel speeds down.
+    tracebackActionDurationMs = (unsigned long)roundf((float)stored.durationMs / scale);
+  }
+
+  tracebackActionLoaded = true;
+  tracebackActionTiming = false;
+}
+
+void completeTracebackAction() {
+  tracebackActionsRemaining--;
+  tracebackReadIndex = (tracebackReadIndex - 1 + MOTION_HISTORY_SIZE) % MOTION_HISTORY_SIZE;
+  tracebackActionLoaded = false;
+  tracebackActionTiming = false;
+}
+
+void enterReacquireVerification(ControlState returnState, unsigned long nowMs) {
+  reacquireReturnState = returnState;
+  consecutiveReacquiredSamples = 1;
+  tracebackActionTiming = false;
+  stopMotors();
+  setControlState(STATE_REACQUIRE_VERIFY, nowMs);
+}
+
+void completeRecovery(unsigned long nowMs) {
+  stopMotors();
+  clearMotionHistory();
+  resetPidState();
+  consecutiveLostSamples = 0;
+  consecutiveReacquiredSamples = 0;
+  setControlState(STATE_TRACKING, nowMs);
+}
+
+void runTraceback(unsigned long nowMs, float dtSeconds) {
+  if (blackDetected) {
+    enterReacquireVerification(STATE_TRACEBACK, nowMs);
+    return;
+  }
+
+  if (tracebackActionsRemaining <= 0) {
+    stopMotors();
+    setControlState(STATE_RECOVERY_FAILED, nowMs);
+    return;
+  }
+
+  if (!tracebackActionLoaded) loadNextTracebackAction();
+  if (!tracebackActionTiming) {
+    tracebackActionStartedMs = nowMs;
+    tracebackActionTiming = true;
+  }
+
+  // Count slew/transition time as part of the stored action. Waiting to reach each target before
+  // starting its timer would add extra reverse distance that did not exist in the forward history.
+  if (nowMs - tracebackActionStartedMs >= tracebackActionDurationMs) {
+    completeTracebackAction();
+    if (tracebackActionsRemaining <= 0) {
+      stopMotors();
+      setControlState(STATE_RECOVERY_FAILED, nowMs);
+      return;
+    }
+    loadNextTracebackAction();
+    tracebackActionStartedMs = nowMs;
+    tracebackActionTiming = true;
+  }
+
+  int nextLeft = slewInteger(
+    leftMotorSpeed,
+    tracebackTargetLeft,
+    TRACEBACK_PWM_CHANGE_PER_SECOND,
+    dtSeconds
+  );
+  int nextRight = slewInteger(
+    rightMotorSpeed,
+    tracebackTargetRight,
+    TRACEBACK_PWM_CHANGE_PER_SECOND,
+    dtSeconds
+  );
+  applyMotorSpeeds(nextLeft, nextRight);
+}
+
+// =================================================================================================
+// Non-blocking control state machine.
+
+void updateControlState(unsigned long nowMs, float dtSeconds) {
+  switch (controlState) {
+    case STATE_TRACKING:
+      if (!blackDetected) {
+        finishMotionWindow(nowMs);  // Freeze the valid path on the first no-black sample.
+        consecutiveLostSamples = 1;
+        stopMotors();
+        resetPidState();
+        setControlState(STATE_LOSS_PENDING, nowMs);
+      } else {
+        consecutiveLostSamples = 0;
+        driveWithPidAndConfidence(dtSeconds);
+        recordTrackingMotion(nowMs);
+      }
+      break;
+
+    case STATE_LOSS_PENDING:
+      stopMotors();
+      if (blackDetected) {
+        consecutiveLostSamples = 0;
+        resetPidState();
+        setControlState(STATE_TRACKING, nowMs);
+      } else {
+        consecutiveLostSamples++;
+        if (consecutiveLostSamples >= LINE_LOST_CONFIRMATION_SAMPLES) {
+          if (motionHistoryCount > 0) prepareTraceback(nowMs);
+          else setControlState(STATE_RECOVERY_FAILED, nowMs);
+        }
+      }
+      break;
+
+    case STATE_TRACEBACK_SETTLE:
+      stopMotors();
+      if (blackDetected) {
+        enterReacquireVerification(STATE_TRACEBACK_SETTLE, nowMs);
+      } else if (nowMs - stateEnteredMs >= TRACEBACK_SETTLE_MS) {
+        if (tracebackActionsRemaining > 0) setControlState(STATE_TRACEBACK, nowMs);
+        else setControlState(STATE_RECOVERY_FAILED, nowMs);
+      }
+      break;
+
+    case STATE_TRACEBACK:
+      runTraceback(nowMs, dtSeconds);
+      break;
+
+    case STATE_REACQUIRE_VERIFY:
+      stopMotors();
+      if (blackDetected) {
+        consecutiveReacquiredSamples++;
+        if (consecutiveReacquiredSamples >= LINE_REACQUIRE_CONFIRMATION_SAMPLES) {
+          completeRecovery(nowMs);
+        }
+      } else {
+        consecutiveReacquiredSamples = 0;
+        if (reacquireReturnState == STATE_TRACEBACK) {
+          tracebackActionTiming = false;
+          setControlState(STATE_TRACEBACK, nowMs);
+        } else if (reacquireReturnState == STATE_TRACEBACK_SETTLE) {
+          setControlState(STATE_TRACEBACK_SETTLE, nowMs);
+        } else {
+          setControlState(STATE_RECOVERY_FAILED, nowMs);
+        }
+      }
+      break;
+
+    case STATE_RECOVERY_FAILED:
+      stopMotors();
+      if (blackDetected) enterReacquireVerification(STATE_RECOVERY_FAILED, nowMs);
+      break;
+  }
+}
+
+// =================================================================================================
+// Telemetry and optional scope output.
+
+bool scopeDebugConfigured() {
+  return ENABLE_SCOPE_DEBUG
+      && SCOPE_ERROR_PIN >= 0
+      && SCOPE_TURN_PIN >= 0
+      && SCOPE_SYNC_PIN >= 0;
+}
+
+int signedValueToScopeDuty(float value, float fullScale) {
+  float bounded = clampFloat(value, -fullScale, fullScale);
+  float fraction = (bounded + fullScale) / (2.0f * fullScale);
+  return clampInt((int)roundf(255.0f * fraction), 0, 255);
+}
+
+void writeScopeDebug() {
+  if (!scopeDebugConfigured()) return;
+  ledcWrite(SCOPE_ERROR_PIN, signedValueToScopeDuty(lineError, 3.0f));
+  ledcWrite(SCOPE_TURN_PIN, signedValueToScopeDuty(appliedTurn, MAX_TURN));
+}
+
+void printTelemetry(unsigned long nowMs) {
+  if (!ENABLE_SERIAL_TELEMETRY || nowMs - lastTelemetryMs < TELEMETRY_INTERVAL_MS) return;
+  lastTelemetryMs = nowMs;
+
+  // Arduino Serial Plotter accepts label:value fields separated by tabs.
+  Serial.print("error:");
+  Serial.print(lineError, 4);
+  Serial.print('\t');
+  Serial.print("P:");
+  Serial.print(pTerm, 3);
+  Serial.print('\t');
+  Serial.print("I:");
+  Serial.print(iTerm, 3);
+  Serial.print('\t');
+  Serial.print("D:");
+  Serial.print(dTerm, 3);
+  Serial.print('\t');
+  Serial.print("turn:");
+  Serial.print(appliedTurn, 3);
+  Serial.print('\t');
+  Serial.print("confidence:");
+  Serial.print(lineConfidence, 3);
+  Serial.print('\t');
+  Serial.print("checksPassed:");
+  Serial.print(confidenceAccumulator.checksPassed);
+  Serial.print('\t');
+  Serial.print("checksCompleted:");
+  Serial.print(confidenceAccumulator.checksCompleted);
+  Serial.print('\t');
+  Serial.print("pidChecks:");
+  Serial.print(consecutivePidChecks);
+  Serial.print('\t');
+  Serial.print("black:");
+  Serial.print(blackDetected ? 1 : 0);
+  Serial.print('\t');
+  Serial.print("left:");
+  Serial.print(leftMotorSpeed);
+  Serial.print('\t');
+  Serial.print("right:");
+  Serial.print(rightMotorSpeed);
+  Serial.print('\t');
+  Serial.print("Kp:");
+  Serial.print(kP, 3);
+  Serial.print('\t');
+  Serial.print("Ki:");
+  Serial.print(kI, 3);
+  Serial.print('\t');
+  Serial.print("Kd:");
+  Serial.print(kD, 3);
+  Serial.print('\t');
+  Serial.print("saturated:");
+  Serial.print(outputWasSaturated ? 1 : 0);
+  Serial.print('\t');
+  Serial.print("state:");
+  Serial.println((int)controlState);
+}
+
+void printMotionHistory() {
+  if (controlState == STATE_TRACKING || controlState == STATE_TRACEBACK) {
+    Serial.println("History printing is available only while the robot is stopped.");
+    return;
+  }
+
+  Serial.println("history_index,left_pwm,right_pwm,duration_ms");
+  int oldestIndex = motionHistoryCount == MOTION_HISTORY_SIZE ? motionHistoryWriteIndex : 0;
+  for (int offset = 0; offset < motionHistoryCount; offset++) {
+    int index = (oldestIndex + offset) % MOTION_HISTORY_SIZE;
+    Serial.print(offset);
+    Serial.print(',');
+    Serial.print(motionHistory[index].leftPwm);
+    Serial.print(',');
+    Serial.print(motionHistory[index].rightPwm);
+    Serial.print(',');
+    Serial.println(motionHistory[index].durationMs);
+  }
+}
+
+void printHelp() {
+  Serial.println("Commands: h = help, p = print motion history while stopped");
+  Serial.print("State: ");
+  Serial.println(stateName(controlState));
+}
+
+void handleSerialCommands() {
+  while (Serial.available() > 0) {
+    char command = (char)Serial.read();
+    if (command == 'h' || command == 'H') printHelp();
+    else if (command == 'p' || command == 'P') printMotionHistory();
+  }
+}
+
+// =================================================================================================
+// Arduino entry points.
+
+void setup() {
+  Serial.begin(SERIAL_BAUD_RATE);
+
+  ledcAttach(M1H, MOTOR_PWM_FREQUENCY, MOTOR_PWM_RESOLUTION_BITS);
+  ledcAttach(M1L, MOTOR_PWM_FREQUENCY, MOTOR_PWM_RESOLUTION_BITS);
+  ledcAttach(M2H, MOTOR_PWM_FREQUENCY, MOTOR_PWM_RESOLUTION_BITS);
+  ledcAttach(M2L, MOTOR_PWM_FREQUENCY, MOTOR_PWM_RESOLUTION_BITS);
+
+  for (int led = 0; led < LED_COUNT; led++) pinMode(LED_PINS[led], OUTPUT);
+
+  if (scopeDebugConfigured()) {
+    ledcAttach(SCOPE_ERROR_PIN, SCOPE_PWM_FREQUENCY, SCOPE_PWM_RESOLUTION_BITS);
+    ledcAttach(SCOPE_TURN_PIN, SCOPE_PWM_FREQUENCY, SCOPE_PWM_RESOLUTION_BITS);
+    pinMode(SCOPE_SYNC_PIN, OUTPUT);
+    digitalWrite(SCOPE_SYNC_PIN, LOW);
+  }
+
+  stopMotors();
+  calibrateSensors();
+  readPotentiometers();
+  clearMotionHistory();
+  resetPidState();
+
+  unsigned long nowMs = millis();
+  lastControlMs = nowMs;
+  lastTelemetryMs = nowMs;
+  setControlState(STATE_TRACKING, nowMs);
+  printHelp();
+}
+
+void loop() {
+  handleSerialCommands();
+
+  unsigned long nowMs = millis();
+  if (nowMs - lastControlMs < CONTROL_INTERVAL_MS) return;
+
+  float dtSeconds = (float)(nowMs - lastControlMs) / 1000.0f;
+  dtSeconds = clampFloat(dtSeconds, 0.001f, 0.050f);
+  lastControlMs = nowMs;
+
+  if (scopeDebugConfigured()) digitalWrite(SCOPE_SYNC_PIN, HIGH);
+
+  readPotentiometers();
+  readPhotoresistors();
+  calculateLineErrorAndSensorConfidence();
+  updateControlState(nowMs, dtSeconds);
+  writeScopeDebug();
+  if (scopeDebugConfigured()) digitalWrite(SCOPE_SYNC_PIN, LOW);
+  printTelemetry(nowMs);
+}
