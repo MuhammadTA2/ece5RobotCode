@@ -124,6 +124,11 @@ const float FULL_CONFIDENCE_SPEED_SCALE = 1.00f;
 // Absolute PID steering correction in PWM units.
 const float MAX_TURN = 160.0f;
 
+// Sensor pins are ordered left-to-right, so a positive error means the line is to the robot's
+// right. +1 makes that error speed up the left wheel and slow the right wheel. Change to -1 only
+// if different motor or sensor wiring makes the robot steer in the opposite direction.
+const float STEERING_DIRECTION = 1.0f;
+
 // Maximum change in steering correction per second. Lower makes steering smoother but slower.
 const float MAX_TURN_CHANGE_PER_SECOND = 1200.0f;
 
@@ -718,8 +723,9 @@ void driveWithPidAndConfidence(float dtSeconds) {
   baseSpeed = min(confidenceSpeed, maximumBaseForTurn);
   outputWasSaturated = confidenceSpeed > maximumBaseForTurn || fabsf(rawTurn) > MAX_TURN;
 
-  int desiredLeft = (int)roundf((float)baseSpeed - appliedTurn);
-  int desiredRight = (int)roundf((float)baseSpeed + appliedTurn);
+  float directedTurn = STEERING_DIRECTION * appliedTurn;
+  int desiredLeft = (int)roundf((float)baseSpeed + directedTurn);
+  int desiredRight = (int)roundf((float)baseSpeed - directedTurn);
   applyMotorSpeeds(desiredLeft, desiredRight);
 }
 
