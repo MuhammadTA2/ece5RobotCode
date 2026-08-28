@@ -10,6 +10,7 @@
    - Weighted line confidence and confidence-based speed reduction
    - PID anti-windup, derivative filtering, turn clamping, and turn slew limiting
    - Motor mixing that preserves steering instead of clipping one saturated wheel
+   - Measured motor deadband compensation so nonzero commands produce usable wheel motion
    - Automatic physical traceback after confirmed total line loss
    - Sixteen stored post-PID wheel actions, including PID steering and action duration
    - Serial Plotter telemetry plus optional oscilloscope debug PWM outputs
@@ -107,6 +108,15 @@ const int NOMINAL_SPEED = 110;
 const int SPEED_POT_ADDITION_MAX = 100;
 const int MAX_REQUESTED_CRUISE_SPEED = 220;
 
+// Bench testing found that all four motor directions start reliably at PWM 170. A 5-count margin
+// is included here. Re-test after changing motors, battery, wheels, or gearing, then replace 175
+// with the lowest value that starts every motor direction reliably.
+const int MIN_EFFECTIVE_MOTOR_PWM = 175;
+
+// Logical PID commands at or below this magnitude are treated as a true stop. Increase if PID
+// noise makes a nearly stopped wheel chatter between forward and reverse; lower for finer pivots.
+const int MOTOR_COMMAND_STOP_BAND = 10;
+
 // At low confidence the robot retains this fraction of requested cruise speed.
 // Lower for caution; raise if the robot stalls before it can correct.
 const float LOW_CONFIDENCE_SPEED_SCALE = 0.35f;
@@ -164,8 +174,9 @@ const unsigned long MOTION_ACTION_INTERVAL_MS = 20;
 // Stop before changing from forward to reverse to reduce current and mechanical shock.
 const unsigned long TRACEBACK_SETTLE_MS = 60;
 
-// Traceback keeps the stored left/right steering ratio but scales both if either exceeds this PWM.
-const int TRACEBACK_MAX_PWM = 160;
+// Traceback maps its logical commands into this lower physical PWM ceiling. It must never be below
+// MIN_EFFECTIVE_MOTOR_PWM or the wheels may not turn. Raise for stronger recovery; lower for safety.
+const int TRACEBACK_MAX_PHYSICAL_PWM = 200;
 
 // Reverse command slew rate after the stopped settling period.
 const float TRACEBACK_PWM_CHANGE_PER_SECOND = 4000.0f;
@@ -224,8 +235,8 @@ enum ControlState {
 };
 
 struct MotionAction {
-  int leftPwm;
-  int rightPwm;
+  int leftCommand;
+  int rightCommand;
   unsigned int durationMs;
 };
 
@@ -281,8 +292,13 @@ float lineConfidence = 0.0f;
 int consecutivePidChecks = 0;
 
 int baseSpeed = 0;
+// These are post-PID logical commands. They stay in -255..255 units so motion history can replay
+// the same steering request without applying motor deadband compensation twice.
 int leftMotorSpeed = 0;
 int rightMotorSpeed = 0;
+// These are the signed PWM values actually sent to the physical left and right motors.
+int leftAppliedPwm = 0;
+int rightAppliedPwm = 0;
 
 ControlState controlState = STATE_TRACKING;
 ControlState reacquireReturnState = STATE_TRACEBACK;
@@ -351,6 +367,23 @@ void setControlState(ControlState nextState, unsigned long nowMs) {
 // =================================================================================================
 // Motor output.
 
+int compensateMotorDeadband(int logicalSpeed, int maximumPhysicalPwm) {
+  int boundedCommand = clampInt(logicalSpeed, -255, 255);
+  int commandMagnitude = abs(boundedCommand);
+
+  if (commandMagnitude <= MOTOR_COMMAND_STOP_BAND) return 0;
+
+  int boundedMaximum = clampInt(maximumPhysicalPwm, MIN_EFFECTIVE_MOTOR_PWM, 255);
+  float commandProgress = (float)(commandMagnitude - MOTOR_COMMAND_STOP_BAND)
+                          / (float)(255 - MOTOR_COMMAND_STOP_BAND);
+  int physicalMagnitude = (int)roundf(
+    (float)MIN_EFFECTIVE_MOTOR_PWM
+    + commandProgress * (float)(boundedMaximum - MIN_EFFECTIVE_MOTOR_PWM)
+  );
+
+  return boundedCommand < 0 ? -physicalMagnitude : physicalMagnitude;
+}
+
 void runMotorAtSpeed(MotorSide side, int speed) {
   int boundedSpeed = clampInt(speed, -255, 255);
 
@@ -373,13 +406,23 @@ void runMotorAtSpeed(MotorSide side, int speed) {
   }
 }
 
-void applyMotorSpeeds(int logicalLeftSpeed, int logicalRightSpeed) {
+void applyMotorSpeedsWithLimit(
+  int logicalLeftSpeed,
+  int logicalRightSpeed,
+  int maximumPhysicalPwm
+) {
   leftMotorSpeed = clampInt(logicalLeftSpeed, -255, 255);
   rightMotorSpeed = clampInt(logicalRightSpeed, -255, 255);
+  leftAppliedPwm = compensateMotorDeadband(leftMotorSpeed, maximumPhysicalPwm);
+  rightAppliedPwm = compensateMotorDeadband(rightMotorSpeed, maximumPhysicalPwm);
 
   // Preserve the original sketch's physical motor-to-pin orientation.
-  runMotorAtSpeed(LEFT_MOTOR, rightMotorSpeed);
-  runMotorAtSpeed(RIGHT_MOTOR, leftMotorSpeed);
+  runMotorAtSpeed(LEFT_MOTOR, rightAppliedPwm);
+  runMotorAtSpeed(RIGHT_MOTOR, leftAppliedPwm);
+}
+
+void applyMotorSpeeds(int logicalLeftSpeed, int logicalRightSpeed) {
+  applyMotorSpeedsWithLimit(logicalLeftSpeed, logicalRightSpeed, 255);
 }
 
 void stopMotors() {
@@ -745,7 +788,7 @@ void driveWithPidAndConfidence(float dtSeconds) {
 }
 
 // =================================================================================================
-// Sixteen-action physical motion history and traceback.
+// Sixteen-action post-PID command history and physical traceback.
 
 void clearMotionHistory() {
   motionHistoryWriteIndex = 0;
@@ -757,12 +800,12 @@ void clearMotionHistory() {
   motionWindowActive = false;
 }
 
-void storeMotionAction(int leftPwm, int rightPwm, unsigned long durationMs) {
+void storeMotionAction(int leftCommand, int rightCommand, unsigned long durationMs) {
   if (durationMs == 0) return;
 
   MotionAction &entry = motionHistory[motionHistoryWriteIndex];
-  entry.leftPwm = clampInt(leftPwm, -255, 255);
-  entry.rightPwm = clampInt(rightPwm, -255, 255);
+  entry.leftCommand = clampInt(leftCommand, -255, 255);
+  entry.rightCommand = clampInt(rightCommand, -255, 255);
   entry.durationMs = (unsigned int)min(durationMs, 65535UL);
 
   motionHistoryWriteIndex = (motionHistoryWriteIndex + 1) % MOTION_HISTORY_SIZE;
@@ -823,18 +866,30 @@ void loadNextTracebackAction() {
   if (tracebackActionsRemaining <= 0) return;
 
   const MotionAction &stored = motionHistory[tracebackReadIndex];
-  int maximumMagnitude = max(abs(stored.leftPwm), abs(stored.rightPwm));
+  int forwardPhysicalLeft = abs(compensateMotorDeadband(stored.leftCommand, 255));
+  int forwardPhysicalRight = abs(compensateMotorDeadband(stored.rightCommand, 255));
+  int reversePhysicalLeft = abs(
+    compensateMotorDeadband(-stored.leftCommand, TRACEBACK_MAX_PHYSICAL_PWM)
+  );
+  int reversePhysicalRight = abs(
+    compensateMotorDeadband(-stored.rightCommand, TRACEBACK_MAX_PHYSICAL_PWM)
+  );
+  int forwardMaximum = max(forwardPhysicalLeft, forwardPhysicalRight);
+  int reverseMaximum = max(reversePhysicalLeft, reversePhysicalRight);
 
-  if (maximumMagnitude == 0) {
+  if (forwardMaximum == 0 || reverseMaximum == 0) {
     tracebackTargetLeft = 0;
     tracebackTargetRight = 0;
     tracebackActionDurationMs = stored.durationMs;
   } else {
-    float scale = min(1.0f, (float)TRACEBACK_MAX_PWM / (float)maximumMagnitude);
-    tracebackTargetLeft = (int)roundf(-(float)stored.leftPwm * scale);
-    tracebackTargetRight = (int)roundf(-(float)stored.rightPwm * scale);
-    // Compensate approximately for scaling the wheel speeds down.
-    tracebackActionDurationMs = (unsigned long)roundf((float)stored.durationMs / scale);
+    tracebackTargetLeft = -stored.leftCommand;
+    tracebackTargetRight = -stored.rightCommand;
+    // The reverse ceiling is intentionally lower than normal driving. Extend the action by the
+    // dominant wheel's forward/reverse PWM ratio to approximately preserve traveled distance.
+    float durationScale = (float)forwardMaximum / (float)reverseMaximum;
+    tracebackActionDurationMs = (unsigned long)roundf(
+      (float)stored.durationMs * durationScale
+    );
   }
 
   tracebackActionLoaded = true;
@@ -909,7 +964,7 @@ void runTraceback(unsigned long nowMs, float dtSeconds) {
     TRACEBACK_PWM_CHANGE_PER_SECOND,
     dtSeconds
   );
-  applyMotorSpeeds(nextLeft, nextRight);
+  applyMotorSpeedsWithLimit(nextLeft, nextRight, TRACEBACK_MAX_PHYSICAL_PWM);
 }
 
 // =================================================================================================
@@ -1044,11 +1099,17 @@ void printTelemetry(unsigned long nowMs) {
   Serial.print("black:");
   Serial.print(blackDetected ? 1 : 0);
   Serial.print('\t');
-  Serial.print("left:");
+  Serial.print("leftCmd:");
   Serial.print(leftMotorSpeed);
   Serial.print('\t');
-  Serial.print("right:");
+  Serial.print("rightCmd:");
   Serial.print(rightMotorSpeed);
+  Serial.print('\t');
+  Serial.print("leftPwm:");
+  Serial.print(leftAppliedPwm);
+  Serial.print('\t');
+  Serial.print("rightPwm:");
+  Serial.print(rightAppliedPwm);
   Serial.print('\t');
   Serial.print("Kp:");
   Serial.print(kP, 3);
@@ -1072,15 +1133,15 @@ void printMotionHistory() {
     return;
   }
 
-  Serial.println("history_index,left_pwm,right_pwm,duration_ms");
+  Serial.println("history_index,left_command,right_command,duration_ms");
   int oldestIndex = motionHistoryCount == MOTION_HISTORY_SIZE ? motionHistoryWriteIndex : 0;
   for (int offset = 0; offset < motionHistoryCount; offset++) {
     int index = (oldestIndex + offset) % MOTION_HISTORY_SIZE;
     Serial.print(offset);
     Serial.print(',');
-    Serial.print(motionHistory[index].leftPwm);
+    Serial.print(motionHistory[index].leftCommand);
     Serial.print(',');
-    Serial.print(motionHistory[index].rightPwm);
+    Serial.print(motionHistory[index].rightCommand);
     Serial.print(',');
     Serial.println(motionHistory[index].durationMs);
   }
