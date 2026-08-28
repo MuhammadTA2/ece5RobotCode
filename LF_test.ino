@@ -31,9 +31,13 @@ const unsigned long CONTROL_INTERVAL_MS = 10;
 // Sensor calibration and detection.
 const int CALIBRATION_MEASUREMENTS = 20;
 const unsigned long CALIBRATION_COLOR_CHANGE_MS = 2000;
-const float MIN_CALIBRATION_SPAN = 50.0f;
-const int BLACK_DETECTION_THRESHOLD = 30;
-const float PEAK_TO_AVERAGE_RATIO = 1.50f;
+// The original accepts even small white/black spans. Keep only a small guard against division by
+// zero; raise this later only if telemetry proves that a sensor is dominated by noise.
+const float MIN_CALIBRATION_SPAN = 1.0f;
+
+// The original stores 1.5 in an integer CriteriaForMax, so its effective comparison ratio is 1.0.
+// Matching that behavior prevents valid side-sensor readings from being rejected before PID runs.
+const float PEAK_TO_AVERAGE_RATIO = 1.00f;
 
 // Speed-pot calibration. If the knob works backward, change SPEED_POT_REVERSED to true. If the
 // physical potentiometer does not reach 0 or 4095, replace the endpoint values with measured ADCs.
@@ -229,8 +233,7 @@ bool calculateLineError() {
     }
   }
 
-  if (peakValue < BLACK_DETECTION_THRESHOLD
-      || (float)peakValue <= PEAK_TO_AVERAGE_RATIO * average) {
+  if ((float)peakValue <= PEAK_TO_AVERAGE_RATIO * average) {
     return false;
   }
 
