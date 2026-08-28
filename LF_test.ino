@@ -116,12 +116,17 @@ const int MIN_EFFECTIVE_MOTOR_PWM = 175;
 // noise makes a nearly stopped wheel chatter between forward and reverse; lower for finer pivots.
 const int MOTOR_COMMAND_STOP_BAND = 10;
 
+// While a line is detected, neither wheel is allowed below this forward logical command. Keep it
+// above MOTOR_COMMAND_STOP_BAND. Raise it if the inside wheel stalls while turning; lower it for
+// tighter turns. Motor deadband compensation maps this value to a usable physical PWM.
+const int MIN_TRACKING_WHEEL_COMMAND = 20;
+
 // At low confidence the robot retains this fraction of requested cruise speed.
 // Lower for caution; raise if the robot stalls before it can correct.
 const float LOW_CONFIDENCE_SPEED_SCALE = 0.35f;
 const float FULL_CONFIDENCE_SPEED_SCALE = 1.00f;
 
-// Absolute PID steering correction in PWM units.
+// PID correction at or above this magnitude applies the maximum inside-wheel slowdown.
 const float MAX_TURN = 160.0f;
 
 // Sensor pins are ordered left-to-right, so a positive error means the line is to the robot's
@@ -717,15 +722,23 @@ void driveWithPidAndConfidence(float dtSeconds) {
                    * (FULL_CONFIDENCE_SPEED_SCALE - LOW_CONFIDENCE_SPEED_SCALE);
   int confidenceSpeed = (int)roundf((float)requestedCruiseSpeed * speedScale);
 
-  // Reserve PWM headroom for steering. This preserves left/right difference instead of clipping
-  // only the faster wheel when baseSpeed +/- appliedTurn would exceed the motor limit.
-  int maximumBaseForTurn = max(0, 255 - (int)ceilf(fabsf(appliedTurn)));
-  baseSpeed = min(confidenceSpeed, maximumBaseForTurn);
-  outputWasSaturated = confidenceSpeed > maximumBaseForTurn || fabsf(rawTurn) > MAX_TURN;
-
+  // Forward-only differential steering: confidence controls the outside-wheel cruise speed and
+  // PID slows the inside wheel. Neither wheel reverses or stops while a valid line is detected.
+  baseSpeed = clampInt(confidenceSpeed, MIN_TRACKING_WHEEL_COMMAND, 255);
   float directedTurn = STEERING_DIRECTION * appliedTurn;
-  int desiredLeft = (int)roundf((float)baseSpeed + directedTurn);
-  int desiredRight = (int)roundf((float)baseSpeed - directedTurn);
+  float turnFraction = clampFloat(fabsf(directedTurn) / MAX_TURN, 0.0f, 1.0f);
+  int insideWheelSpeed = (int)roundf(
+    (float)baseSpeed
+    - turnFraction * (float)(baseSpeed - MIN_TRACKING_WHEEL_COMMAND)
+  );
+
+  int desiredLeft = baseSpeed;
+  int desiredRight = baseSpeed;
+  if (directedTurn > 0.0f) desiredRight = insideWheelSpeed;
+  else if (directedTurn < 0.0f) desiredLeft = insideWheelSpeed;
+
+  outputWasSaturated = confidenceSpeed < MIN_TRACKING_WHEEL_COMMAND
+                    || fabsf(rawTurn) > MAX_TURN;
   applyMotorSpeeds(desiredLeft, desiredRight);
 }
 
