@@ -49,19 +49,19 @@ void applyTestOutput() {
 
   switch (selectedTest) {
     case MTR1_FORWARD:
-      ledcWrite(M1H, testPwm);
+      ledcWrite(M1H, testPwm+150);
       break;
 
     case MTR1_REVERSE:
-      ledcWrite(M1L, testPwm);
+      ledcWrite(M1L, testPwm+150);
       break;
 
     case MTR2_FORWARD:
-      ledcWrite(M2H, testPwm);
+      ledcWrite(M2H, testPwm+150);
       break;
 
     case MTR2_REVERSE:
-      ledcWrite(M2L, testPwm);
+      ledcWrite(M2L, testPwm+150);
       break;
 
     case NONE:
