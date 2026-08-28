@@ -11,8 +11,7 @@
    - PID anti-windup, derivative filtering, turn clamping, and turn slew limiting
    - Motor mixing that preserves steering instead of clipping one saturated wheel
    - Measured motor deadband compensation so nonzero commands produce usable wheel motion
-   - Automatic physical traceback after confirmed total line loss
-   - Sixteen stored post-PID wheel actions, including PID steering and action duration
+   - Confirmed line loss stops the motors; confirmed line reacquisition restarts normal PID control
    - Serial Plotter telemetry plus optional oscilloscope debug PWM outputs
 
    RECOMMENDED TEST ORDER
@@ -21,7 +20,7 @@
    3. Tune BLACK_DETECTION_THRESHOLD at low speed.
    4. Set Ki and Kd to zero. Raise Kp until oscillation starts, then reduce Kp 20-30%.
    5. Add Kd until oscillation is damped. Add only enough Ki to remove persistent bias.
-   6. Tune speed, turn limits, confidence, and finally traceback.
+   6. Tune speed, turn limits, and confidence.
 
    POTENTIOMETER MATH
      fraction = filtered ADC / 4095
@@ -103,7 +102,7 @@ const int POTENTIOMETER_ZERO_DEAD_ZONE_ADC = 30;
 const unsigned long CONTROL_INTERVAL_MS = 10;
 
 // Starting forward PWM plus 0-SPEED_POT_ADDITION_MAX from the speed potentiometer.
-// Increase gradually. Lower speeds make calibration and traceback safer.
+// Increase gradually. Lower speeds make PID calibration safer.
 const int NOMINAL_SPEED = 110;
 const int SPEED_POT_ADDITION_MAX = 100;
 const int MAX_REQUESTED_CRUISE_SPEED = 220;
@@ -136,8 +135,8 @@ const float DERIVATIVE_FILTER_TIME_CONSTANT_SECONDS = 0.040f;
 
 // --- CONFIDENCE -----------------------------------------------------------------------------------
 
-// Confidence below this value uses the minimum speed scale. It does NOT trigger traceback while
-// any photoresistor still sees black.
+// Confidence below this value uses the minimum speed scale. Complete line loss is handled
+// separately and stops both motors.
 const float MIN_LINE_CONFIDENCE = 0.60f;
 
 // PID must be reasonable for this many consecutive cycles to earn full PID-history confidence.
@@ -159,27 +158,13 @@ const float WEIGHT_ERROR_CONTINUITY = 0.10f;
 const float WEIGHT_PID_OUTPUT = 0.10f;
 const float WEIGHT_PID_HISTORY = 0.15f;
 
-// --- TRACEBACK ------------------------------------------------------------------------------------
+// --- LINE-LOSS SAFETY -----------------------------------------------------------------------------
 
 // Three no-black samples at a 10 ms control interval confirm complete line loss.
 const int LINE_LOST_CONFIRMATION_SAMPLES = 3;
 
-// Require two black samples after traceback before normal PID control resumes.
+// Require two consecutive black samples before normal PID control resumes after any line loss.
 const int LINE_REACQUIRE_CONFIRMATION_SAMPLES = 2;
-
-// Store one averaged post-PID motor action every 20 ms. 16 actions cover about 320 ms.
-const int MOTION_HISTORY_SIZE = 16;
-const unsigned long MOTION_ACTION_INTERVAL_MS = 20;
-
-// Stop before changing from forward to reverse to reduce current and mechanical shock.
-const unsigned long TRACEBACK_SETTLE_MS = 60;
-
-// Traceback maps its logical commands into this lower physical PWM ceiling. It must never be below
-// MIN_EFFECTIVE_MOTOR_PWM or the wheels may not turn. Raise for stronger recovery; lower for safety.
-const int TRACEBACK_MAX_PHYSICAL_PWM = 200;
-
-// Reverse command slew rate after the stopped settling period.
-const float TRACEBACK_PWM_CHANGE_PER_SECOND = 4000.0f;
 
 // --- TELEMETRY AND OPTIONAL SCOPE OUTPUTS ---------------------------------------------------------
 
@@ -228,16 +213,8 @@ const int MOTOR_PWM_RESOLUTION_BITS = 8;
 enum ControlState {
   STATE_TRACKING = 0,
   STATE_LOSS_PENDING = 1,
-  STATE_TRACEBACK_SETTLE = 2,
-  STATE_TRACEBACK = 3,
-  STATE_REACQUIRE_VERIFY = 4,
-  STATE_RECOVERY_FAILED = 5
-};
-
-struct MotionAction {
-  int leftCommand;
-  int rightCommand;
-  unsigned int durationMs;
+  STATE_LINE_LOST = 2,
+  STATE_REACQUIRE_VERIFY = 3
 };
 
 struct ConfidenceAccumulator {
@@ -292,8 +269,7 @@ float lineConfidence = 0.0f;
 int consecutivePidChecks = 0;
 
 int baseSpeed = 0;
-// These are post-PID logical commands. They stay in -255..255 units so motion history can replay
-// the same steering request without applying motor deadband compensation twice.
+// These are post-PID logical commands in -255..255 units, before motor deadband compensation.
 int leftMotorSpeed = 0;
 int rightMotorSpeed = 0;
 // These are the signed PWM values actually sent to the physical left and right motors.
@@ -301,29 +277,8 @@ int leftAppliedPwm = 0;
 int rightAppliedPwm = 0;
 
 ControlState controlState = STATE_TRACKING;
-ControlState reacquireReturnState = STATE_TRACEBACK;
-unsigned long stateEnteredMs = 0;
 int consecutiveLostSamples = 0;
 int consecutiveReacquiredSamples = 0;
-
-MotionAction motionHistory[MOTION_HISTORY_SIZE];
-int motionHistoryWriteIndex = 0;
-int motionHistoryCount = 0;
-
-long motionWindowLeftSum = 0;
-long motionWindowRightSum = 0;
-int motionWindowSampleCount = 0;
-unsigned long motionWindowStartedMs = 0;
-bool motionWindowActive = false;
-
-int tracebackReadIndex = 0;
-int tracebackActionsRemaining = 0;
-bool tracebackActionLoaded = false;
-bool tracebackActionTiming = false;
-int tracebackTargetLeft = 0;
-int tracebackTargetRight = 0;
-unsigned long tracebackActionStartedMs = 0;
-unsigned long tracebackActionDurationMs = 0;
 
 unsigned long lastControlMs = 0;
 unsigned long lastTelemetryMs = 0;
@@ -347,10 +302,8 @@ const char *stateName(ControlState state) {
   switch (state) {
     case STATE_TRACKING: return "TRACKING";
     case STATE_LOSS_PENDING: return "LOSS_PENDING";
-    case STATE_TRACEBACK_SETTLE: return "TRACEBACK_SETTLE";
-    case STATE_TRACEBACK: return "TRACEBACK";
+    case STATE_LINE_LOST: return "LINE_LOST";
     case STATE_REACQUIRE_VERIFY: return "REACQUIRE_VERIFY";
-    case STATE_RECOVERY_FAILED: return "RECOVERY_FAILED";
     default: return "UNKNOWN";
   }
 }
@@ -359,26 +312,24 @@ void setLeds(int value) {
   for (int i = 0; i < LED_COUNT; i++) digitalWrite(LED_PINS[i], value);
 }
 
-void setControlState(ControlState nextState, unsigned long nowMs) {
+void setControlState(ControlState nextState) {
   controlState = nextState;
-  stateEnteredMs = nowMs;
 }
 
 // =================================================================================================
 // Motor output.
 
-int compensateMotorDeadband(int logicalSpeed, int maximumPhysicalPwm) {
+int compensateMotorDeadband(int logicalSpeed) {
   int boundedCommand = clampInt(logicalSpeed, -255, 255);
   int commandMagnitude = abs(boundedCommand);
 
   if (commandMagnitude <= MOTOR_COMMAND_STOP_BAND) return 0;
 
-  int boundedMaximum = clampInt(maximumPhysicalPwm, MIN_EFFECTIVE_MOTOR_PWM, 255);
   float commandProgress = (float)(commandMagnitude - MOTOR_COMMAND_STOP_BAND)
                           / (float)(255 - MOTOR_COMMAND_STOP_BAND);
   int physicalMagnitude = (int)roundf(
     (float)MIN_EFFECTIVE_MOTOR_PWM
-    + commandProgress * (float)(boundedMaximum - MIN_EFFECTIVE_MOTOR_PWM)
+    + commandProgress * (float)(255 - MIN_EFFECTIVE_MOTOR_PWM)
   );
 
   return boundedCommand < 0 ? -physicalMagnitude : physicalMagnitude;
@@ -406,35 +357,20 @@ void runMotorAtSpeed(MotorSide side, int speed) {
   }
 }
 
-void applyMotorSpeedsWithLimit(
-  int logicalLeftSpeed,
-  int logicalRightSpeed,
-  int maximumPhysicalPwm
-) {
+void applyMotorSpeeds(int logicalLeftSpeed, int logicalRightSpeed) {
   leftMotorSpeed = clampInt(logicalLeftSpeed, -255, 255);
   rightMotorSpeed = clampInt(logicalRightSpeed, -255, 255);
-  leftAppliedPwm = compensateMotorDeadband(leftMotorSpeed, maximumPhysicalPwm);
-  rightAppliedPwm = compensateMotorDeadband(rightMotorSpeed, maximumPhysicalPwm);
+  leftAppliedPwm = compensateMotorDeadband(leftMotorSpeed);
+  rightAppliedPwm = compensateMotorDeadband(rightMotorSpeed);
 
   // Preserve the original sketch's physical motor-to-pin orientation.
   runMotorAtSpeed(LEFT_MOTOR, rightAppliedPwm);
   runMotorAtSpeed(RIGHT_MOTOR, leftAppliedPwm);
 }
 
-void applyMotorSpeeds(int logicalLeftSpeed, int logicalRightSpeed) {
-  applyMotorSpeedsWithLimit(logicalLeftSpeed, logicalRightSpeed, 255);
-}
-
 void stopMotors() {
   applyMotorSpeeds(0, 0);
   baseSpeed = 0;
-}
-
-int slewInteger(int current, int target, float ratePerSecond, float dtSeconds) {
-  int maximumStep = max(1, (int)roundf(ratePerSecond * dtSeconds));
-  if (target > current + maximumStep) return current + maximumStep;
-  if (target < current - maximumStep) return current - maximumStep;
-  return target;
 }
 
 // =================================================================================================
@@ -788,231 +724,51 @@ void driveWithPidAndConfidence(float dtSeconds) {
 }
 
 // =================================================================================================
-// Sixteen-action post-PID command history and physical traceback.
+// Sensor-driven line-loss safety. There is no reverse motion or stored-action recovery.
 
-void clearMotionHistory() {
-  motionHistoryWriteIndex = 0;
-  motionHistoryCount = 0;
-  motionWindowLeftSum = 0;
-  motionWindowRightSum = 0;
-  motionWindowSampleCount = 0;
-  motionWindowStartedMs = 0;
-  motionWindowActive = false;
-}
-
-void storeMotionAction(int leftCommand, int rightCommand, unsigned long durationMs) {
-  if (durationMs == 0) return;
-
-  MotionAction &entry = motionHistory[motionHistoryWriteIndex];
-  entry.leftCommand = clampInt(leftCommand, -255, 255);
-  entry.rightCommand = clampInt(rightCommand, -255, 255);
-  entry.durationMs = (unsigned int)min(durationMs, 65535UL);
-
-  motionHistoryWriteIndex = (motionHistoryWriteIndex + 1) % MOTION_HISTORY_SIZE;
-  if (motionHistoryCount < MOTION_HISTORY_SIZE) motionHistoryCount++;
-}
-
-void resetMotionWindow(unsigned long nowMs) {
-  motionWindowLeftSum = 0;
-  motionWindowRightSum = 0;
-  motionWindowSampleCount = 0;
-  motionWindowStartedMs = nowMs;
-  motionWindowActive = true;
-}
-
-void finishMotionWindow(unsigned long nowMs) {
-  if (!motionWindowActive || motionWindowSampleCount <= 0) return;
-
-  unsigned long durationMs = nowMs - motionWindowStartedMs;
-  if (durationMs > 0) {
-    int averageLeft = (int)roundf((float)motionWindowLeftSum / (float)motionWindowSampleCount);
-    int averageRight = (int)roundf((float)motionWindowRightSum / (float)motionWindowSampleCount);
-    storeMotionAction(averageLeft, averageRight, durationMs);
-  }
-
-  motionWindowActive = false;
-  motionWindowSampleCount = 0;
-  motionWindowLeftSum = 0;
-  motionWindowRightSum = 0;
-}
-
-void recordTrackingMotion(unsigned long nowMs) {
-  if (!motionWindowActive) resetMotionWindow(nowMs);
-
-  // Close the previous time window before assigning the current sample to the next one. This keeps
-  // adjacent 20 ms actions contiguous instead of counting the boundary sample in the old window.
-  if (nowMs - motionWindowStartedMs >= MOTION_ACTION_INTERVAL_MS) {
-    finishMotionWindow(nowMs);
-    resetMotionWindow(nowMs);
-  }
-
-  motionWindowLeftSum += leftMotorSpeed;
-  motionWindowRightSum += rightMotorSpeed;
-  motionWindowSampleCount++;
-}
-
-void prepareTraceback(unsigned long nowMs) {
-  tracebackActionsRemaining = motionHistoryCount;
-  tracebackReadIndex = (motionHistoryWriteIndex - 1 + MOTION_HISTORY_SIZE) % MOTION_HISTORY_SIZE;
-  tracebackActionLoaded = false;
-  tracebackActionTiming = false;
-  tracebackTargetLeft = 0;
-  tracebackTargetRight = 0;
+void beginReacquireVerification() {
   stopMotors();
-  setControlState(STATE_TRACEBACK_SETTLE, nowMs);
-}
-
-void loadNextTracebackAction() {
-  if (tracebackActionsRemaining <= 0) return;
-
-  const MotionAction &stored = motionHistory[tracebackReadIndex];
-  int forwardPhysicalLeft = abs(compensateMotorDeadband(stored.leftCommand, 255));
-  int forwardPhysicalRight = abs(compensateMotorDeadband(stored.rightCommand, 255));
-  int reversePhysicalLeft = abs(
-    compensateMotorDeadband(-stored.leftCommand, TRACEBACK_MAX_PHYSICAL_PWM)
-  );
-  int reversePhysicalRight = abs(
-    compensateMotorDeadband(-stored.rightCommand, TRACEBACK_MAX_PHYSICAL_PWM)
-  );
-  int forwardMaximum = max(forwardPhysicalLeft, forwardPhysicalRight);
-  int reverseMaximum = max(reversePhysicalLeft, reversePhysicalRight);
-
-  if (forwardMaximum == 0 || reverseMaximum == 0) {
-    tracebackTargetLeft = 0;
-    tracebackTargetRight = 0;
-    tracebackActionDurationMs = stored.durationMs;
-  } else {
-    tracebackTargetLeft = -stored.leftCommand;
-    tracebackTargetRight = -stored.rightCommand;
-    // The reverse ceiling is intentionally lower than normal driving. Extend the action by the
-    // dominant wheel's forward/reverse PWM ratio to approximately preserve traveled distance.
-    float durationScale = (float)forwardMaximum / (float)reverseMaximum;
-    tracebackActionDurationMs = (unsigned long)roundf(
-      (float)stored.durationMs * durationScale
-    );
-  }
-
-  tracebackActionLoaded = true;
-  tracebackActionTiming = false;
-}
-
-void completeTracebackAction() {
-  tracebackActionsRemaining--;
-  tracebackReadIndex = (tracebackReadIndex - 1 + MOTION_HISTORY_SIZE) % MOTION_HISTORY_SIZE;
-  tracebackActionLoaded = false;
-  tracebackActionTiming = false;
-}
-
-void enterReacquireVerification(ControlState returnState, unsigned long nowMs) {
-  reacquireReturnState = returnState;
   consecutiveReacquiredSamples = 1;
-  tracebackActionTiming = false;
-  stopMotors();
-  setControlState(STATE_REACQUIRE_VERIFY, nowMs);
+  setControlState(STATE_REACQUIRE_VERIFY);
 }
 
-void completeRecovery(unsigned long nowMs) {
+void completeLineReacquisition() {
   stopMotors();
-  clearMotionHistory();
   resetPidState();
   consecutiveLostSamples = 0;
   consecutiveReacquiredSamples = 0;
-  setControlState(STATE_TRACKING, nowMs);
+  setControlState(STATE_TRACKING);
 }
 
-void runTraceback(unsigned long nowMs, float dtSeconds) {
-  if (blackDetected) {
-    enterReacquireVerification(STATE_TRACEBACK, nowMs);
-    return;
-  }
-
-  if (tracebackActionsRemaining <= 0) {
-    stopMotors();
-    setControlState(STATE_RECOVERY_FAILED, nowMs);
-    return;
-  }
-
-  if (!tracebackActionLoaded) loadNextTracebackAction();
-  if (!tracebackActionTiming) {
-    tracebackActionStartedMs = nowMs;
-    tracebackActionTiming = true;
-  }
-
-  // Count slew/transition time as part of the stored action. Waiting to reach each target before
-  // starting its timer would add extra reverse distance that did not exist in the forward history.
-  if (nowMs - tracebackActionStartedMs >= tracebackActionDurationMs) {
-    completeTracebackAction();
-    if (tracebackActionsRemaining <= 0) {
-      stopMotors();
-      setControlState(STATE_RECOVERY_FAILED, nowMs);
-      return;
-    }
-    loadNextTracebackAction();
-    tracebackActionStartedMs = nowMs;
-    tracebackActionTiming = true;
-  }
-
-  int nextLeft = slewInteger(
-    leftMotorSpeed,
-    tracebackTargetLeft,
-    TRACEBACK_PWM_CHANGE_PER_SECOND,
-    dtSeconds
-  );
-  int nextRight = slewInteger(
-    rightMotorSpeed,
-    tracebackTargetRight,
-    TRACEBACK_PWM_CHANGE_PER_SECOND,
-    dtSeconds
-  );
-  applyMotorSpeedsWithLimit(nextLeft, nextRight, TRACEBACK_MAX_PHYSICAL_PWM);
-}
-
-// =================================================================================================
-// Non-blocking control state machine.
-
-void updateControlState(unsigned long nowMs, float dtSeconds) {
+void updateControlState(float dtSeconds) {
   switch (controlState) {
     case STATE_TRACKING:
       if (!blackDetected) {
-        finishMotionWindow(nowMs);  // Freeze the valid path on the first no-black sample.
         consecutiveLostSamples = 1;
         stopMotors();
         resetPidState();
-        setControlState(STATE_LOSS_PENDING, nowMs);
+        setControlState(STATE_LOSS_PENDING);
       } else {
         consecutiveLostSamples = 0;
         driveWithPidAndConfidence(dtSeconds);
-        recordTrackingMotion(nowMs);
       }
       break;
 
     case STATE_LOSS_PENDING:
       stopMotors();
       if (blackDetected) {
-        consecutiveLostSamples = 0;
-        resetPidState();
-        setControlState(STATE_TRACKING, nowMs);
+        beginReacquireVerification();
       } else {
         consecutiveLostSamples++;
         if (consecutiveLostSamples >= LINE_LOST_CONFIRMATION_SAMPLES) {
-          if (motionHistoryCount > 0) prepareTraceback(nowMs);
-          else setControlState(STATE_RECOVERY_FAILED, nowMs);
+          setControlState(STATE_LINE_LOST);
         }
       }
       break;
 
-    case STATE_TRACEBACK_SETTLE:
+    case STATE_LINE_LOST:
       stopMotors();
-      if (blackDetected) {
-        enterReacquireVerification(STATE_TRACEBACK_SETTLE, nowMs);
-      } else if (nowMs - stateEnteredMs >= TRACEBACK_SETTLE_MS) {
-        if (tracebackActionsRemaining > 0) setControlState(STATE_TRACEBACK, nowMs);
-        else setControlState(STATE_RECOVERY_FAILED, nowMs);
-      }
-      break;
-
-    case STATE_TRACEBACK:
-      runTraceback(nowMs, dtSeconds);
+      if (blackDetected) beginReacquireVerification();
       break;
 
     case STATE_REACQUIRE_VERIFY:
@@ -1020,24 +776,13 @@ void updateControlState(unsigned long nowMs, float dtSeconds) {
       if (blackDetected) {
         consecutiveReacquiredSamples++;
         if (consecutiveReacquiredSamples >= LINE_REACQUIRE_CONFIRMATION_SAMPLES) {
-          completeRecovery(nowMs);
+          completeLineReacquisition();
         }
       } else {
         consecutiveReacquiredSamples = 0;
-        if (reacquireReturnState == STATE_TRACEBACK) {
-          tracebackActionTiming = false;
-          setControlState(STATE_TRACEBACK, nowMs);
-        } else if (reacquireReturnState == STATE_TRACEBACK_SETTLE) {
-          setControlState(STATE_TRACEBACK_SETTLE, nowMs);
-        } else {
-          setControlState(STATE_RECOVERY_FAILED, nowMs);
-        }
+        consecutiveLostSamples = LINE_LOST_CONFIRMATION_SAMPLES;
+        setControlState(STATE_LINE_LOST);
       }
-      break;
-
-    case STATE_RECOVERY_FAILED:
-      stopMotors();
-      if (blackDetected) enterReacquireVerification(STATE_RECOVERY_FAILED, nowMs);
       break;
   }
 }
@@ -1127,28 +872,8 @@ void printTelemetry(unsigned long nowMs) {
   Serial.println((int)controlState);
 }
 
-void printMotionHistory() {
-  if (controlState == STATE_TRACKING || controlState == STATE_TRACEBACK) {
-    Serial.println("History printing is available only while the robot is stopped.");
-    return;
-  }
-
-  Serial.println("history_index,left_command,right_command,duration_ms");
-  int oldestIndex = motionHistoryCount == MOTION_HISTORY_SIZE ? motionHistoryWriteIndex : 0;
-  for (int offset = 0; offset < motionHistoryCount; offset++) {
-    int index = (oldestIndex + offset) % MOTION_HISTORY_SIZE;
-    Serial.print(offset);
-    Serial.print(',');
-    Serial.print(motionHistory[index].leftCommand);
-    Serial.print(',');
-    Serial.print(motionHistory[index].rightCommand);
-    Serial.print(',');
-    Serial.println(motionHistory[index].durationMs);
-  }
-}
-
 void printHelp() {
-  Serial.println("Commands: h = help, p = print motion history while stopped");
+  Serial.println("Commands: h = help");
   Serial.print("State: ");
   Serial.println(stateName(controlState));
 }
@@ -1157,7 +882,6 @@ void handleSerialCommands() {
   while (Serial.available() > 0) {
     char command = (char)Serial.read();
     if (command == 'h' || command == 'H') printHelp();
-    else if (command == 'p' || command == 'P') printMotionHistory();
   }
 }
 
@@ -1184,13 +908,12 @@ void setup() {
   stopMotors();
   calibrateSensors();
   readPotentiometers();
-  clearMotionHistory();
   resetPidState();
 
   unsigned long nowMs = millis();
   lastControlMs = nowMs;
   lastTelemetryMs = nowMs;
-  setControlState(STATE_TRACKING, nowMs);
+  setControlState(STATE_TRACKING);
   printHelp();
 }
 
@@ -1209,7 +932,7 @@ void loop() {
   readPotentiometers();
   readPhotoresistors();
   calculateLineErrorAndSensorConfidence();
-  updateControlState(nowMs, dtSeconds);
+  updateControlState(dtSeconds);
   writeScopeDebug();
   if (scopeDebugConfigured()) digitalWrite(SCOPE_SYNC_PIN, LOW);
   printTelemetry(nowMs);
