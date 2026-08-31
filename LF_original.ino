@@ -60,7 +60,7 @@ int M2L = 44;
 // Potentiometer Pins
 const int S_pin = 10; // Pin connected to Speed potentiometer
 const int P_pin = 11; // Pin connected to P term potentiometer
-const int I_pin = 12; // Pin connected to I term potentiometer
+const int I_pin = 14; // Pin connected to I term potentiometer
 const int D_pin = 13; // Pin connected to D term potentiometer
                                                                  
 int led_Pins[] = {17};  // LEDs to indicate what part of calibration you're on and to illuminate the photoresistors
