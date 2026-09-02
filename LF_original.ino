@@ -249,8 +249,9 @@ int ReadPotentiometerHelper(int pin, int min_resolution, int max_resolution, int
 // Function to read photo resistors and map from 0 to 100
 void ReadPhotoResistors() {
   for (int i = 0; i < totalPhotoResistors; i++) { 
-    rawPResistorData[i] = analogRead(LDR_Pin[i]);
-    LDR[i] = map(rawPResistorData[i], Mn[i], Mx[i], 0, 100); // Mn and Mx are created from calibration Min and Max for each pin
+     rawPResistorData[i] = analogRead(LDR_Pin[i]);
+     LDR[i] = map(rawPResistorData[i], Mn[i], Mx[i], 0, 100); // Mn and Mx are created from calibration Min and Max for each pin
+     LDR[i] = min(max(LDR[i], 0), 100);
   }    
 
 } // end ReadPhotoResistors()
