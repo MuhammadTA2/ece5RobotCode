@@ -93,7 +93,7 @@ float AveRead, WeightedAve;
 
 // For Motor Control
 const int speedControl = 15;
-int max_speed = 255;
+int max_speed = 230;
 int speed = 0;
 
 int M1SpeedtoMotor, M2SpeedtoMotor;
@@ -361,7 +361,7 @@ void CalcError() {
 // PID Function
 void PID_Turn() {
   kP = (float)kPRead * 1.8;    // each of these scaling factors can change depending on how influential you want them to be
-  kI = (float)kIRead * 0.001;
+  kI = (float)kIRead * 0.00;
   kD = (float)kDRead * 0.01;
 
   Turn = error * kP + sumerror * kI + (error - lasterror) * kD; // PID!!!!!!!!!!!!!
