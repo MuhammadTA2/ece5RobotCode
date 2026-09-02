@@ -54,7 +54,7 @@ enum side {LEFT, RIGHT};
 int LDR_Pin[] = {1, 2, 3, 4, 5, 6, 7}; // SET PINS CONNECTED TO PHOTORESISTORS // FROM LEFT TO RIGHT OF THE ROBOT, ROBOT IS ORIENTED WHERE PHOTORESISOTRS FARTHEST FROM YOU AND WHEELS ARE CLOSEST TO YOU      
 float filteredLDR[20] = {0};
 //Lower = more filtering, higher = faster response
-const float ALPHA = 0.5;
+const float ALPHA = 1;
 bool filterInitialized = false;
 
 //
@@ -83,7 +83,7 @@ int kDRead = 0; // derivative gain
 float Mn[20]; 
 float Mx[20];
 float LDRf[20];
-int LDR[20];    
+int LDR[20];
 int rawPResistorData[20];  
 int totalPhotoResistors = sizeof(LDR_Pin) / sizeof(LDR_Pin[0]);  
 int numLEDs = sizeof(led_Pins) / sizeof(led_Pins[0]); 
@@ -92,8 +92,8 @@ int leftHighestPR, highestPResistor, rightHighestPR;
 float AveRead, WeightedAve;   
 
 // For Motor Control
-const int speedControl = 10;
-int max_speed = 200;
+const int speedControl = 15;
+int max_speed = 255;
 int speed = 0;
 
 int M1SpeedtoMotor, M2SpeedtoMotor;
