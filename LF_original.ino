@@ -337,7 +337,7 @@ void CalcError() {
 void PID_Turn() {
   kP = (float)kPRead * 1.;    // each of these scaling factors can change depending on how influential you want them to be
   kI = (float)kIRead * 0.001;
-  kD = (float)kDRead * 0.01;
+  kD = (float)kDRead * 0.02;
 
   Turn = error * kP + sumerror * kI + (error - lasterror) * kD; // PID!!!!!!!!!!!!!
 
