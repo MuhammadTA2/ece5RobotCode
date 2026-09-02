@@ -81,7 +81,8 @@ int LDR[20];
 int rawPResistorData[20];  
 int totalPhotoResistors = sizeof(LDR_Pin) / sizeof(LDR_Pin[0]);  
 int numLEDs = sizeof(led_Pins) / sizeof(led_Pins[0]); 
-int MxRead, MxIndex, CriteriaForMax;
+int MxRead, MxIndex;
+float CriteriaForMax;
 int leftHighestPR, highestPResistor, rightHighestPR;
 float AveRead, WeightedAve;   
 
@@ -156,7 +157,7 @@ void loop() {
 
 void Calibrate() {
 
-  int numberOfMeasurements = 20;                // set number Of Measurements to take
+  int numberOfMeasurements = 50;                // set number Of Measurements to take
 
   CalibrateHelper(numberOfMeasurements, false); // White Calibration
 
